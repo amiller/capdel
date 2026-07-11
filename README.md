@@ -53,3 +53,12 @@ the API is its only route to the resource. It can bootstrap entirely from
 `GET /caps/<id>`. Confinement of the agent *process* is a separate, composable
 layer (run it in Docker+gVisor/Deno with only those two env vars) — the broker
 bounds what the token can do, the sandbox bounds what the process can do.
+
+## Remote agents + the dashboard (`pod/`)
+
+For an agent on another machine (a zed/Paseo worker), the laptop broker **dials
+out** to a rendezvous instead of listening — `capdel tunnel --relay <url>
+--broker-id NAME`. The rendezvous is `pod/`, a dstack pod app (Deno) that forwards
+remote requests down the tunnel and never holds authority, plus a read-only
+dashboard of the live grant tree pulled through the tunnel. Run the whole thing
+locally with `deno run` — see `pod/README.md`. Design rationale is SPEC §3.7.
