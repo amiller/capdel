@@ -49,11 +49,20 @@ function connectedBrokers(): string[] {
   return [...lastSeen.entries()].filter(([, t]) => now - t < 60000).map(([b]) => b);
 }
 
+let demoHtml: string | null = null;
+async function getDemo(): Promise<string> {
+  if (demoHtml === null) demoHtml = await Deno.readTextFile(new URL("./public/demo.html", import.meta.url));
+  return demoHtml;
+}
+
 export default async function handler(req: Request, ctx: { env: Record<string, string> }): Promise<Response> {
   const env = ctx.env || {};
   const RELAY_SECRET = env.CAPDEL_RELAY_SECRET, OWNER_SECRET = env.CAPDEL_OWNER_SECRET;
   const url = new URL(req.url);
   const path = url.pathname;
+
+  // --- public shareable demo page (no broker, no secret) ---
+  if (path === "/demo" || path === "/demo/") return html(await getDemo());
 
   // --- laptop side: long-poll for the next request aimed at this broker ---
   if (path.startsWith("/_pull/")) {
@@ -187,7 +196,8 @@ function renderLocked(): string {
   return `<!doctype html><meta charset="utf-8"><title>capdel relay</title>
 <body style="font:15px system-ui;max-width:480px;margin:80px auto;color:#12252a">
 <h1 style="font-size:19px">capdel relay</h1>
-<p style="color:#6b8189">This dashboard is gated. Append <code>?key=&lt;relay-secret&gt;</code> to view.</p></body>`;
+<p style="color:#6b8189">The live dashboard is gated. Append <code>?key=&lt;relay-secret&gt;</code> to view real capabilities,
+or see the <a href="demo" style="color:#03636a">read-only demo</a>.</p></body>`;
 }
 
 // Dev harness: `deno run -A relay.ts` serves the same handler standalone for local testing.

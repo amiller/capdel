@@ -32,14 +32,15 @@ PY
 )
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-tar czf "$TMP/app.tgz" -C "$DIR" relay.ts project.json
+tar czf "$TMP/app.tgz" -C "$DIR" relay.ts project.json public
 RESP=$(curl -fsS -X POST "$CVM/_api/projects" \
   -H "Authorization: Bearer $TEE_DAEMON_TOKEN" \
   -F "manifest=$MANIFEST;type=application/json" \
   -F "files=@$TMP/app.tgz")
 echo "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("deployed:",d["name"],"| mode:",d.get("mode"),"| tree:",d.get("tree_hash","")[:12])'
 echo
-echo "Relay live → $CVM/capdel-relay/?key=<relay-secret>   (read-only dashboard)"
+echo "Shareable demo (public)  → $CVM/capdel-relay/demo"
+echo "Live dashboard (gated)   → $CVM/capdel-relay/?key=<relay-secret>"
 echo "On the laptop, alongside 'capdel serve':"
 echo "  CAPDEL_OWNER_SECRET=<owner> capdel serve"
 echo "  CAPDEL_RELAY_SECRET=<relay> capdel tunnel --relay $CVM/capdel-relay --broker-id laptop1"
