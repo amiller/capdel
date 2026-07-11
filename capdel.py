@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """capdel — broker for dynamic capability delegation to agents. See SPEC.md."""
-import argparse, hashlib, json, os, re, secrets, subprocess, sys, time
+import argparse, base64, hashlib, json, os, re, secrets, socket, subprocess, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -74,6 +74,11 @@ def validate_constraints(type_, c):
             raise Denied("exec 'allow' must be a non-empty list of argv prefixes (lists of strings)")
         if not (isinstance(c.get("cwd_root"), str) and os.path.isabs(c["cwd_root"])):
             raise Denied("exec constraints need an absolute 'cwd_root'")
+    elif type_ == "net":
+        allow = c.get("allow")
+        if not allow or not all(isinstance(a, list) and len(a) == 2 and isinstance(a[0], str)
+                                and isinstance(a[1], int) and a[1] >= 0 for a in allow):
+            raise Denied("net 'allow' must be a non-empty list of [host, port] (port int, 0=any)")
     else:
         raise Denied(f"unknown capability type {type_!r}")
 
@@ -89,7 +94,7 @@ def check_subset(type_, child, parent_cap):
             raise Denied(f"root {child['root']} is not under parent root {p['root']}")
         if child.get("max_bytes", DEF_MAX_BYTES) > p.get("max_bytes", DEF_MAX_BYTES):
             raise Denied("max_bytes exceeds parent's")
-    else:
+    elif type_ == "exec":
         for a in child["allow"]:
             if not any(a[:len(pref)] == pref for pref in p["allow"]):
                 raise Denied(f"argv prefix {a} is not an extension of any parent prefix {p['allow']}")
@@ -99,6 +104,14 @@ def check_subset(type_, child, parent_cap):
             raise Denied("timeout_s exceeds parent's")
         if child.get("max_output", DEF_MAX_OUTPUT) > p.get("max_output", DEF_MAX_OUTPUT):
             raise Denied("max_output exceeds parent's")
+    else:  # net
+        for ch, cp in child["allow"]:
+            if not any(ph == ch and (pp == 0 or pp == cp) for ph, pp in p["allow"]):
+                raise Denied(f"destination [{ch}, {cp}] not covered by parent allow {p['allow']}")
+        if child.get("max_bytes", DEF_MAX_BYTES) > p.get("max_bytes", DEF_MAX_BYTES):
+            raise Denied("max_bytes exceeds parent's")
+        if child.get("timeout_s", DEF_TIMEOUT) > p.get("timeout_s", DEF_TIMEOUT):
+            raise Denied("timeout_s exceeds parent's")
 
 
 def mint(type_, constraints, name, ttl_s, parent=None):
@@ -160,12 +173,36 @@ def exec_invoke(cap, body):
             "truncated": len(r.stdout) > mo or len(r.stderr) > mo}
 
 
+def net_invoke(cap, body):
+    c = cap["constraints"]
+    if body.get("op") != "connect":
+        raise Denied(f"op {body.get('op')!r} not supported; net op is 'connect'")
+    host, port = body["host"], int(body["port"])
+    if not any(ph == host and (pp == 0 or pp == port) for ph, pp in c["allow"]):
+        raise Denied(f"[{host}, {port}] not in allowed destinations {c['allow']}")
+    max_bytes = c.get("max_bytes", DEF_MAX_BYTES)
+    timeout_s = c.get("timeout_s", DEF_TIMEOUT)
+    send = base64.b64decode(body["send"]) if body.get("send") else b""
+    chunks, total = [], 0
+    with socket.create_connection((host, port), timeout=timeout_s) as s:
+        s.settimeout(timeout_s)
+        if send: s.sendall(send)
+        while total < max_bytes:
+            b = s.recv(min(65536, max_bytes - total))
+            if not b: break
+            chunks.append(b); total += len(b)
+    return {"recv": base64.b64encode(b"".join(chunks)).decode(), "bytes": total,
+            "truncated": total >= max_bytes}
+
+
 def describe(cap, base):
     how = {
         "fs": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"list\",\"path\":\"{cap['constraints'].get('root','')}\"}}' {base}/caps/{cap['id']}/invoke",
                'ops: {"op":"list|read|stat","path":…} {"op":"write","path":…,"content":…}'],
         "exec": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"run\",\"argv\":[\"ls\"]}}' {base}/caps/{cap['id']}/invoke",
                  'op: {"op":"run","argv":[…],"cwd"?:…,"stdin"?:…}'],
+        "net": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{cap['constraints']['allow'][0][0]}\",\"port\":{cap['constraints']['allow'][0][1]}}}' {base}/caps/{cap['id']}/invoke",
+                'op: {"op":"connect","host":…,"port":…,"send"?:<base64>} → {recv:<base64>,bytes,truncated}; send a request with Connection: close so the peer closes'],
     }[cap["type"]]
     return {"id": cap["id"], "name": cap["name"], "type": cap["type"],
             "constraints": cap["constraints"], "expires_at": cap["expires_at"],
@@ -231,11 +268,11 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             check_live(cap)
             if action == "invoke":
-                result = (fs_invoke if cap["type"] == "fs" else exec_invoke)(cap, body)
+                result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke}[cap["type"]](cap, body)
                 cap["last_used"] = now()
                 save(CAPS, cap)
                 audit(event="invoke", cap=cap["id"], op=body.get("op"),
-                      arg=body.get("path") or body.get("argv"), decision="allow")
+                      arg=body.get("path") or body.get("argv") or body.get("host"), decision="allow")
                 return self._json(200, result)
             if action == "attenuate":
                 child, token = mint(cap["type"], body["constraints"], body.get("name", f"child of {cap['id']}"),
@@ -257,6 +294,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": str(e)})
         except subprocess.TimeoutExpired as e:
             return self._json(408, {"error": f"timed out after {e.timeout}s"})
+        except TimeoutError:
+            return self._json(408, {"error": "connection timed out (peer may not have closed; send Connection: close)"})
+        except OSError as e:
+            return self._json(502, {"error": f"connection failed: {e}"})
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
@@ -272,7 +313,10 @@ def fmt_constraints(cap):
     c = cap["constraints"]
     if cap["type"] == "fs":
         return f"fs {','.join(c['ops'])} {c['root']}"
-    return f"exec [{' | '.join(' '.join(a) for a in c['allow'])}] cwd={c['cwd_root']}"
+    if cap["type"] == "exec":
+        return f"exec [{' | '.join(' '.join(a) for a in c['allow'])}] cwd={c['cwd_root']}"
+    dests = ', '.join(f"{h}:{p if p else '*'}" for h, p in c["allow"])
+    return f"net [{dests}]"
 
 
 def cmd_tree(_):
@@ -291,12 +335,23 @@ def cmd_tree(_):
         walk(c, 0)
 
 
+def parse_dest(s):
+    host, sep, port = s.rpartition(":")
+    if not sep or not host:
+        raise SystemExit(f"bad destination {s!r} (use host:port or host:*)")
+    return [host, 0 if port in ("*", "0", "") else int(port)]
+
+
 def cmd_mint(a):
     if a.type == "fs":
         constraints = {"root": os.path.realpath(a.root), "ops": a.ops.split(",")}
         if a.max_bytes: constraints["max_bytes"] = a.max_bytes
-    else:
+    elif a.type == "exec":
         constraints = {"allow": [al.split() for al in a.allow], "cwd_root": os.path.realpath(a.cwd_root)}
+        if a.timeout: constraints["timeout_s"] = a.timeout
+    else:  # net
+        constraints = {"allow": [parse_dest(al) for al in a.allow]}
+        if a.max_bytes: constraints["max_bytes"] = a.max_bytes
         if a.timeout: constraints["timeout_s"] = a.timeout
     cap, token = mint(a.type, constraints, a.name, parse_ttl(a.ttl))
     print(f"id={cap['id']}\ntoken={token}\nexpires_at={cap['expires_at']}")
@@ -362,7 +417,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve"); s.add_argument("--bind", default="127.0.0.1:4571"); s.set_defaults(f=cmd_serve)
     s = sub.add_parser("mint")
-    s.add_argument("type", choices=["fs", "exec"])
+    s.add_argument("type", choices=["fs", "exec", "net"])
     s.add_argument("--root"); s.add_argument("--ops", default="list,read"); s.add_argument("--max-bytes", type=int, dest="max_bytes")
     s.add_argument("--allow", action="append", default=[]); s.add_argument("--cwd-root", dest="cwd_root"); s.add_argument("--timeout", type=int)
     s.add_argument("--ttl", default="4h"); s.add_argument("--name", default="root grant")

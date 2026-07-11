@@ -112,8 +112,31 @@ Enforcement: the requested argv must extend one of the `allow` prefixes exactly
 not). No shell — argv is passed to `subprocess.run(list)` directly, so there is no
 quoting/injection surface. `cwd` must resolve inside `cwd_root`.
 
-Both types are deliberately *deny-by-default and prefix-shaped*: the subset relation
-needed for attenuation (3.2) is decidable by inspection.
+**`net`** — scoped outbound network access *from the broker's machine*. The inverse
+of the pod's shared openvpn-socks5 egress: instead of routing a remote agent's whole
+traffic out one exit, this lends one specific dial-out as a capability. It exists
+for the case where a remote agent needs the owner's *network position* (residential
+IP, a LAN device, a service only reachable from home) rather than its files or shell.
+
+```json
+{ "allow": [["api.github.com", 443], ["10.0.0.5", 0]],  // (host, port) prefixes; port 0 = any
+  "max_bytes": 10485760,                                 // per connection, optional
+  "timeout_s": 30 }
+```
+
+Enforcement is a brokered CONNECT, **not a proxy handle**: the agent asks the broker
+to open one TCP connection to an allowed `(host, port)`; the broker dials, then
+relays bytes for that single connection and closes. `host` matches literally (no DNS
+wildcards in v0 — an exact hostname or IP); `port` must equal an allowed port or the
+entry's port is `0` (any). The agent never receives a socket, a SOCKS endpoint, or
+the ability to open a second connection off the same grant — every connection is a
+fresh `invoke` that re-checks the allowlist and is audited. This is the deliberate
+non-answer to "just give it SOCKS5 back": a raw proxy is ambient L4 authority over
+the whole home vantage; a `net` capability is a per-destination, per-connection,
+revocable grant shaped exactly like `fs` paths and `exec` argv.
+
+The three types are deliberately *deny-by-default and prefix-shaped*: the subset
+relation needed for attenuation (3.2) is decidable by inspection.
 
 ### 3.2 Attenuation rules
 
@@ -125,6 +148,9 @@ calls, no LLM in the loop at enforcement time.
   `child.max_bytes ≤ parent.max_bytes`.
 - exec: every `child.allow` entry must have some `parent.allow` entry as a prefix;
   `child.cwd_root` under `parent.cwd_root`; `child.timeout_s ≤`, `child.max_output ≤`.
+- net: every `child.allow` entry `(h, p)` must be covered by some parent entry
+  `(h, p')` where `h` is identical and `p' == 0` (parent allows any port) or
+  `p' == p`; `child.max_bytes ≤ parent.max_bytes`, `child.timeout_s ≤`.
 - all: `child.expires_at ≤ parent.expires_at`; same `type`.
 
 Anyone holding a token can attenuate it further (delegation is not owner-only —
@@ -170,11 +196,58 @@ These two views *are* the read-only dashboard for v0; an HTML rendering is v0.2.
 
 ### 3.7 Remote use (R4)
 
-The broker binds localhost by default. For remote agents, expose it the way any
-local service is exposed (ssh -R, tailscale, pagekite) — the broker does not invent
-its own tunnel. Tokens are bearer; TLS/tunnel integrity is assumed from the
-transport. DPoP-style proof-of-possession is noted as future hardening
-(anti-teleport, per the delegation-landscape survey).
+The broker binds localhost by default. Reaching it from a remote agent is the whole
+point of R4 — but **the tunnel is transport, never authority**. Nothing about how
+bytes reach the broker changes what a token is allowed to do; the tunnel only
+determines who can *knock*, and the token determines what happens when they do.
+
+**Principle: dial out, don't listen.** A SOCKS5 proxy or `ssh -R` that terminates at
+the laptop hands the remote side raw L4 reach into the home network — exactly the
+ambient over-grant `net` (§3.1) exists to replace. So the laptop broker makes an
+**outbound** connection to a public rendezvous and serves capdel requests back down
+it. No inbound ports, NAT-irrelevant, and revocation is "hang up the socket."
+
+**The rendezvous is the pod (dogfooding).** oauth3's tee-daemon already hosts public,
+attested apps, so the rendezvous is a small **relay app** on the pod rather than a
+new piece of infrastructure:
+
+```
+remote agent ──HTTPS──▶ pod: /capdel-relay/<broker-id>/caps/<id>/invoke
+                              │  (oauth3 app; reaching it is itself token-gated)
+                              ▼
+                        relay holds the laptop's live outbound WebSocket
+                              │  forwards the request frame down it
+                              ▼
+   laptop: capdel broker ◀──WSS(dial-out)── relay
+                              │  broker answers locally, frames the response back up
+                              ▼
+                        relay returns the HTTP response to the remote agent
+```
+
+- The laptop runs `capdel tunnel --relay https://pod…/capdel-relay --broker-id …`,
+  which opens and keeps alive one WSS to the relay and pumps request/response frames
+  to the local broker. Purely a byte mux — it parses nothing, enforces nothing.
+- The relay app is ~a screenful: accept a broker's registration WSS, accept inbound
+  HTTP for a registered `broker-id`, forward the request frame, await the matching
+  response frame, reply. It never sees a capability or a decision — enforcement stays
+  on the laptop, in the broker, where the authority actually is.
+- Because the relay is an oauth3 app, **reaching the tunnel is itself a delegated,
+  revocable capability** — the pod's own scoped-token gate sits in front of the
+  capdel URL. Two independent layers now guard a remote invoke: the oauth3 token that
+  lets you talk to the relay at all, and the capdel token that says what you may do.
+  This is where PoP stops being theoretical: once warrants transit a public relay, a
+  bearer token is replayable by the relay operator, so §8's holder-bound-token item
+  becomes the natural next hardening.
+- Off-the-shelf substitutes for the mux if you don't want to host the app: `ssh -R`
+  to any box, or rathole/frp/chisel. Tailscale works but adds a third-party control
+  plane; pagekite has shown 503s under load on zed. The pod relay is preferred
+  precisely because it folds remote-reach into the same token model as everything
+  else.
+
+Tokens are bearer in v0; tunnel/TLS integrity is assumed from the transport (WSS +
+the pod's in-TEE cert). DPoP-style proof-of-possession is the tracked hardening
+(anti-teleport, per the delegation-landscape survey and the Tenuo trial, where a
+warrant is useless without the holder key).
 
 ### 3.8 What the sandbox is for (R8)
 
@@ -199,10 +272,13 @@ capabilities).
   it attenuates. Root minting is offline-only.
 - **The broker is TCB.** ~600 lines of stdlib Python, no deps, no shell, realpath
   containment, prefix-matched argv. Small enough to read.
-- **Known v0 gaps**: bearer tokens (no PoP); no rate limits; fs `write` can fill a
-  disk within max_bytes per call; exec allowlist can't constrain flags beyond prefix
-  (allow `["rg"]` and any rg flags are fair game — write tighter prefixes or wrap in
-  scripts); audit log is unsigned.
+- **Known v0 gaps**: bearer tokens (no PoP) — acute once a token transits the public
+  relay (§3.7), since the relay operator could replay it; no rate limits; fs `write`
+  can fill a disk within max_bytes per call; exec allowlist can't constrain flags
+  beyond prefix (allow `["rg"]` and any rg flags are fair game — write tighter
+  prefixes or wrap in scripts); `net` matches host literally, so it can't express
+  "any subdomain of x" and does nothing about a matched host resolving to an internal
+  IP (pin IPs in the allowlist for SSRF-sensitive targets); audit log is unsigned.
 
 ## 5. HTTP API (v0)
 
@@ -216,7 +292,10 @@ GET  /requests/<rid>        Bearer <token of requesting cap>      → status [+ 
 
 fs invoke ops: `{"op":"list","path"}`, `{"op":"read","path"}`, `{"op":"write","path","content"}`,
 `{"op":"stat","path"}`. exec invoke: `{"op":"run","argv":[…],"cwd"?,"stdin"?}` →
-`{code, stdout, stderr, truncated}`.
+`{code, stdout, stderr, truncated}`. net invoke:
+`{"op":"connect","host":…,"port":…,"send"?:<base64>}` → `{recv:<base64>, bytes, truncated}`
+— one brokered TCP connection to an allowed `(host, port)`, optional bytes sent, reply
+relayed back up to `max_bytes`, then closed.
 
 Errors are always `{"error": …, "violated": …?}` with 4xx — no silent clamping;
 a denied call names the constraint it hit so the agent can decide to escalate.
@@ -225,8 +304,10 @@ a denied call names the constraint it hit so the agent can decide to escalate.
 
 ```
 capdel serve [--bind 127.0.0.1:4571]
-capdel mint fs --root PATH --ops list,read [--ttl 4h] [--name …]      → prints id + token
-capdel mint exec --allow "git status" --allow "ls" --cwd-root PATH …  → prints id + token
+capdel tunnel --relay https://pod…/capdel-relay --broker-id NAME   # dial out to the pod relay (§3.7)
+capdel mint fs   --root PATH --ops list,read [--ttl 4h] [--name …]     → prints id + token
+capdel mint exec --allow "git status" --allow "ls" --cwd-root PATH …   → prints id + token
+capdel mint net  --allow "api.github.com:443" --allow "10.0.0.5:*" …   → prints id + token
 capdel tree | capdel audit [--cap ID] | capdel requests
 capdel approve REQ [--ttl 1h] | capdel deny REQ | capdel revoke CAP
 ```
@@ -238,7 +319,8 @@ State: `$CAPDEL_HOME` (default `~/.capdel`), 0700: `caps/*.json`, `requests/*.js
 
 - **oauth3** — same worldview (delegate a scoped revocable capability, never hand
   over the credential) applied to *web accounts/sessions*; capdel is the same move
-  applied to *local OS authority* (files, processes). Deliberately standalone.
+  applied to *local OS authority* (files, processes, outbound network). Deliberately
+  standalone.
 - **AAuth** — the closest protocol-level neighbor; see §7.1.
 - **UCAN / Biscuit** — offline-attenuable token formats; capdel v0 keeps attenuation
   online (broker-checked) for a smaller TCB, and could adopt Biscuit as the token
@@ -300,8 +382,13 @@ expiry inline; escalate should return poll-interval guidance (`Retry-After`); th
 `want` shape deserves a worked example in the cap self-description.
 
 
+Pod relay app + `capdel tunnel` (§3.7) — the concrete R4 build: a Deno oauth3 app
+that muxes remote HTTP to a laptop broker over a dial-out WSS, with the pod's own
+scoped-token gate in front. DPoP-style holder-bound tokens (§4), promoted from
+"tracked" to "needed" the moment tokens cross that relay. `net` capability
+implementation (§3.1) beyond the spec — brokered CONNECT with per-connection audit.
 Guard scripts attached at attenuation time (arbitrary predicates beyond
 subset-shaped constraints — the "attach scripts that restrict" idea; needs its own
 sandbox story). Notification hooks for escalations (Matrix). HTML read-only
-dashboard. MCP wrapper. DPoP-style token binding. Resource quotas (CPU/mem/disk
-for exec; the "lend a friend's agent limited resources" case). Signed audit.
+dashboard. MCP wrapper. Resource quotas (CPU/mem/disk for exec; the "lend a friend's
+agent limited resources" case). Signed audit.

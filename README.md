@@ -17,8 +17,9 @@ Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capde
 python3 capdel.py serve &                       # broker on 127.0.0.1:4571
 
 # operator mints roots (local CLI only, never over HTTP)
-python3 capdel.py mint fs --root ~/projects/foo --ops list,read,write --ttl 4h
+python3 capdel.py mint fs   --root ~/projects/foo --ops list,read,write --ttl 4h
 python3 capdel.py mint exec --allow "git status" --allow "rg" --cwd-root ~/projects/foo --ttl 4h
+python3 capdel.py mint net  --allow "api.github.com:443" --allow "10.0.0.5:*" --ttl 4h
 # → prints id + token (token shown once; broker stores only its hash)
 
 # trusted agent attenuates at dispatch time and hands the CHILD token to a subagent
@@ -38,7 +39,7 @@ curl -H "Authorization: Bearer $CAPDEL_TOKEN" http://127.0.0.1:4571/caps/$CAP_ID
 |---|---|---|
 | `mint` | operator, CLI | create root authority from nothing |
 | `attenuate` | any token holder | mint a strictly-narrower child (subset checked structurally, 403 otherwise) |
-| `invoke` | any token holder | exercise the capability (fs: list/read/write/stat inside root; exec: allowlisted argv prefixes, no shell) |
+| `invoke` | any token holder | exercise the capability (fs: list/read/write/stat inside root; exec: allowlisted argv prefixes, no shell; net: one brokered TCP connect to an allowlisted host:port) |
 | `escalate` | any token holder | request more, with a reason; owner rules via `capdel approve/deny`; requester polls |
 | `revoke` | operator, CLI | kill a capability and its whole subtree immediately |
 
