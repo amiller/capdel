@@ -1,0 +1,54 @@
+# capdel
+
+> prototype — v0.1, built and subagent-tested 2026-07-11
+
+Dynamic capability delegation for agents: a trusted agent mints narrow, expiring,
+revocable capabilities at dispatch time; less-trusted agents (local subagents or
+remote workers) hold only a token and exercise the authority through a broker on
+the owner's machine. The anti-pattern this replaces: cron-copying cookies and
+credentials into remote machines. See `SPEC.md` for the full design and
+requirements provenance.
+
+Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capdel`).
+
+## Quickstart
+
+```sh
+python3 capdel.py serve &                       # broker on 127.0.0.1:4571
+
+# operator mints roots (local CLI only, never over HTTP)
+python3 capdel.py mint fs --root ~/projects/foo --ops list,read,write --ttl 4h
+python3 capdel.py mint exec --allow "git status" --allow "rg" --cwd-root ~/projects/foo --ttl 4h
+# → prints id + token (token shown once; broker stores only its hash)
+
+# trusted agent attenuates at dispatch time and hands the CHILD token to a subagent
+curl -H "Authorization: Bearer $PARENT_TOKEN" \
+  -d '{"constraints":{"root":"/home/u/projects/foo/docs","ops":["list","read"]},"ttl_s":3600}' \
+  http://127.0.0.1:4571/caps/$PARENT_ID/attenuate
+
+# the subagent needs only two values:
+#   CAPDEL_URL=http://127.0.0.1:4571   CAPDEL_TOKEN=ct-…  (+ cap id in its brief)
+curl -H "Authorization: Bearer $CAPDEL_TOKEN" http://127.0.0.1:4571/caps/$CAP_ID
+# → self-describing: constraints + literal usage examples + how to escalate
+```
+
+## The five verbs
+
+| verb | who | what |
+|---|---|---|
+| `mint` | operator, CLI | create root authority from nothing |
+| `attenuate` | any token holder | mint a strictly-narrower child (subset checked structurally, 403 otherwise) |
+| `invoke` | any token holder | exercise the capability (fs: list/read/write/stat inside root; exec: allowlisted argv prefixes, no shell) |
+| `escalate` | any token holder | request more, with a reason; owner rules via `capdel approve/deny`; requester polls |
+| `revoke` | operator, CLI | kill a capability and its whole subtree immediately |
+
+Legibility: `capdel tree` (live grant tree = the at-a-glance exposure view),
+`capdel audit` (JSONL, every allow/deny), `capdel requests` (pending escalations).
+
+## Trying it on a subagent
+
+Give the subagent nothing but the URL, cap id, and token, and the instruction that
+the API is its only route to the resource. It can bootstrap entirely from
+`GET /caps/<id>`. Confinement of the agent *process* is a separate, composable
+layer (run it in Docker+gVisor/Deno with only those two env vars) — the broker
+bounds what the token can do, the sandbox bounds what the process can do.
