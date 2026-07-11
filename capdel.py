@@ -138,7 +138,10 @@ def fs_invoke(cap, body):
     rp = resolve_inside(c["root"], body["path"])
     max_bytes = c.get("max_bytes", DEF_MAX_BYTES)
     if op == "list":
-        return {"entries": sorted(os.listdir(rp))}
+        with os.scandir(rp) as it:
+            entries = [{"name": e.name, "type": "dir" if e.is_dir() else ("file" if e.is_file() else "other"),
+                        "size": e.stat().st_size if e.is_file() else None} for e in it]
+        return {"entries": sorted(entries, key=lambda x: x["name"])}
     if op == "stat":
         st = os.stat(rp)
         return {"size": st.st_size, "mtime": int(st.st_mtime), "is_dir": os.path.isdir(rp)}
@@ -150,8 +153,9 @@ def fs_invoke(cap, body):
     data = body["content"].encode()
     if len(data) > max_bytes:
         raise Denied(f"write of {len(data)}B is over max_bytes {max_bytes}")
+    created = not os.path.exists(rp)
     Path(rp).write_bytes(data)
-    return {"written": len(data)}
+    return {"path": rp, "written": len(data), "created": created}
 
 
 def exec_invoke(cap, body):
@@ -203,7 +207,7 @@ def describe(cap, base):
     }[cap["type"]]
     return {"id": cap["id"], "name": cap["name"], "type": cap["type"],
             "constraints": cap["constraints"], "expires_at": cap["expires_at"],
-            "escalate": f'POST {base}/caps/{cap["id"]}/escalate {{"want":{{…constraints…}},"reason":…}} then poll GET {base}/requests/<request_id>',
+            "escalate": f'POST {base}/caps/{cap["id"]}/escalate {{"want":{{just the fields to change, e.g. add an op}},"reason":…}} → poll GET {base}/requests/<request_id>; on approval the poll returns a NEW token+cap to switch to',
             "how": how}
 
 
@@ -285,12 +289,17 @@ class Handler(BaseHTTPRequestHandler):
                 child, token = mint(cap["type"], body["constraints"], body.get("name", f"child of {cap['id']}"),
                                     int(body.get("ttl_s", 3600)), parent=cap)
                 return self._json(200, {"id": child["id"], "token": token, "expires_at": child["expires_at"]})
+            # `want` may be a delta — merge it onto the cap's current constraints so a
+            # holder can ask for just the extra op/host without restating root/cwd_root.
+            want = {**cap["constraints"], **(body.get("want") or {})}
+            validate_constraints(cap["type"], want)
             req = {"id": "req-" + secrets.token_hex(6), "cap": cap["id"], "type": cap["type"],
-                   "want": body["want"], "reason": body.get("reason", ""), "status": "pending", "created": now()}
-            validate_constraints(cap["type"], req["want"])
+                   "want": want, "reason": body.get("reason", ""), "status": "pending", "created": now()}
             save(REQS, req)
-            audit(event="escalate", cap=cap["id"], request=req["id"], want=req["want"], reason=req["reason"])
+            audit(event="escalate", cap=cap["id"], request=req["id"], want=want, reason=req["reason"])
             return self._json(200, {"request_id": req["id"], "status": "pending",
+                                    "granted_if_approved": want,
+                                    "note": "if approved, poll returns a NEW token + cap id — switch to them; your current token is unchanged",
                                     "poll": f"GET {self._base()}/requests/{req['id']}"})
         except Denied as e:
             audit(event=action, cap=cap["id"], op=self.path, decision="deny", violated=str(e))

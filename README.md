@@ -25,6 +25,48 @@ Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capde
   tree. Not needed for local use.
 - **`SPEC.md`** — the full design, requirements, and a comparison to prior work.
 
+## Walkthrough — delegate to a helper, in one screen
+
+The whole point of capdel in one story. You give a helper a read-only key, it hits a
+wall, asks, you approve, it finishes — and it never had more than you granted.
+
+```sh
+python3 capdel.py serve &                                    # the doorman (broker)
+U=http://127.0.0.1:4571
+
+# 1. You mint a read-only capability. Prints an id + a token — the "ticket".
+python3 capdel.py mint fs --root ~/work --ops list,read --ttl 30m --name helper
+#   id=cap-e0ce…   token=ct-3471…
+
+# 2. The helper — holding only the token — discovers what it can do (no docs needed):
+curl -H "Authorization: Bearer $TOKEN" $U/caps/$ID
+#   → {constraints:{root:~/work, ops:[list,read]}, how:[…curl examples…], escalate:…}
+
+# 3. It reads (works); every entry carries type + size:
+curl -H "Authorization: Bearer $TOKEN" -d '{"op":"list","path":"…/work"}'      $U/caps/$ID/invoke
+#   → {"entries":[{"name":"report.txt","type":"file","size":32}]}
+
+# 4. It tries to WRITE — refused, with the exact reason:
+curl -H "Authorization: Bearer $TOKEN" -d '{"op":"write","path":"…","content":"x"}' $U/caps/$ID/invoke
+#   → {"error":"denied","violated":"op 'write' not in granted ops ['list','read']"}
+
+# 5. It ASKS — sending only the delta (the new op), not the whole scope:
+curl -H "Authorization: Bearer $TOKEN" -d '{"want":{"ops":["list","read","write"]},"reason":"need to write summary"}' $U/caps/$ID/escalate
+#   → {request_id:req-e76f…, granted_if_approved:{root:~/work, ops:[list,read,write]},
+#      note:"if approved, poll returns a NEW token+cap — switch to them"}
+
+# 6. You rule on it:
+python3 capdel.py requests                    # see who's asking, why, and for exactly what
+python3 capdel.py approve req-e76f… --ttl 20m # mints a fresh grant
+
+# 7. The helper polls, gets the NEW token+cap, and writes — now it works:
+curl -H "Authorization: Bearer $NEW_TOKEN" -d '{"op":"write","path":"…/summary.txt","content":"…"}' $U/caps/$NEW_CAP/invoke
+#   → {"path":"…/work/summary.txt","written":40,"created":true}
+
+# The helper's ORIGINAL token still can't write. Revoke anything, anytime:
+python3 capdel.py revoke $ID                  # kills it and its whole subtree now
+```
+
 ## Quickstart
 
 ```sh
