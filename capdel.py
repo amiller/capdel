@@ -131,12 +131,6 @@ def mint(type_, constraints, name, ttl_s, parent=None):
     return cap, token
 
 
-def root_ancestor(cap):
-    while cap["parent"]:
-        cap = load(CAPS, cap["parent"])
-    return cap
-
-
 def fs_invoke(cap, body):
     c, op = cap["constraints"], body["op"]
     if op not in c["ops"]:
@@ -238,7 +232,10 @@ class Handler(BaseHTTPRequestHandler):
         return cap
 
     def _base(self):
-        return f"http://{self.headers.get('Host', self.server.server_address[0])}"
+        # When a request arrives through the pod relay, the tunnel injects the public
+        # URL so self-description hints point somewhere a remote agent can actually reach.
+        fwd = self.headers.get("X-Capdel-Public-Base")
+        return fwd if fwd else f"http://{self.headers.get('Host', self.server.server_address[0])}"
 
     def _owner_ok(self):
         return bool(OWNER_SECRET) and self._token() == OWNER_SECRET
@@ -392,13 +389,14 @@ def cmd_requests(_):
 def cmd_approve(a):
     req = load(REQS, a.request)
     if not req or req["status"] != "pending": raise SystemExit(f"no pending request {a.request}")
-    root = root_ancestor(load(CAPS, req["cap"]))
-    cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}",
-                      parse_ttl(a.ttl), parent=root)
+    # The owner is the root of authority. An escalation exists because the needed grant
+    # was NOT in the requester's chain, so approving mints it as a fresh owner capability
+    # (same power as `capdel mint`) — not a sibling clamped to the requester's ancestor.
+    cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}", parse_ttl(a.ttl))
     req.update(status="approved", token=token, minted_cap=cap["id"], decided=now())
     save(REQS, req)
     audit(event="approve", request=req["id"], cap=cap["id"])
-    print(f"approved: minted {cap['id']} under {root['id']}")
+    print(f"approved: minted {cap['id']} (fresh owner grant)")
 
 
 def cmd_deny(a):
@@ -456,9 +454,11 @@ def cmd_tunnel(a):
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             time.sleep(3); continue
         body = job.get("body")
+        lheaders = dict(job.get("headers") or {})
+        lheaders["X-Capdel-Public-Base"] = f"{relay}/b/{bid}"  # so hints point at the relay, not localhost
         try:
             with call(local + job["path"], data=body.encode() if body else None,
-                      headers=job.get("headers") or {}, method=job["method"], timeout=90) as lr:
+                      headers=lheaders, method=job["method"], timeout=90) as lr:
                 status, out = lr.status, lr.read().decode()
         except urllib.error.HTTPError as e:
             status, out = e.code, e.read().decode()

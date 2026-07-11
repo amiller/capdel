@@ -173,12 +173,14 @@ GET  /requests/<request_id>          (same token) → pending | denied | {"statu
 ```
 
 The owner sees pending requests via `capdel requests` and rules with
-`capdel approve req-… [--ttl …]` / `capdel deny req-…`. Approval mints a **new
-capability whose parent is the escalated cap's parent** (a sibling, not a child —
-a child could never exceed its parent) with exactly the requested constraints,
-clamped to what the *approving* root can grant. The requesting agent polls and picks
-up the new token. Batching = the owner rules on several at once; notification hooks
-(Matrix, Paseo push) are a v0.2 item — v0 is poll + CLI.
+`capdel approve req-… [--ttl …]` / `capdel deny req-…`. Approval mints the requested
+constraints as a **fresh owner capability** (a new root, `parent: null`) — an
+escalation exists precisely because the needed authority was *not* in the requester's
+chain, so there is no ancestor to clamp against; the owner is the root of authority
+and approving is the same act as `capdel mint`. The requesting agent polls and picks
+up the new token; the lineage (which request, from which cap) is in the new cap's
+name and the audit log. Batching = the owner rules on several at once; how the request
+*reaches* the owner (poll, dashboard, push) is the open design axis — v0 is poll + CLI.
 
 ### 3.5 Discovery (R7)
 
