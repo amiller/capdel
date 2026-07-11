@@ -1,0 +1,37 @@
+# Swarm workers as isolated containers. Each worker gets ONLY CAPDEL_URL + a scoped
+# token + a plan — no source, no credentials, no path to the host but the broker. This is
+# the realistic shape: capdel bounds what the token reaches, the container bounds what the
+# process reaches. Point CAPDEL_URL at a broker on the host or the pod relay.
+#
+#   1. run a broker somewhere reachable (host: `python3 capdel.py serve --bind 0.0.0.0:4571`)
+#   2. mint a token per worker, export them, then:  docker compose up --build
+#
+# The tokens are injected from your shell env so nothing sensitive is baked into the image.
+services:
+  reader:
+    build: {context: ., dockerfile: Dockerfile.worker}
+    environment:
+      CAPDEL_URL: ${CAPDEL_URL:?set CAPDEL_URL}
+      CAPDEL_TOKEN: ${READER_TOKEN:?set READER_TOKEN}
+      CAP_ID: ${READER_CAP:?set READER_CAP}
+      WORKER_PLAN: |
+        {"op":"list","path":"/data/pub"}|200
+        {"op":"read","path":"/data/work/seed.txt"}|403
+    networks: [swarm]
+
+  writer:
+    build: {context: ., dockerfile: Dockerfile.worker}
+    environment:
+      CAPDEL_URL: ${CAPDEL_URL}
+      CAPDEL_TOKEN: ${WRITER_TOKEN:?set WRITER_TOKEN}
+      CAP_ID: ${WRITER_CAP:?set WRITER_CAP}
+      WORKER_PLAN: |
+        {"op":"write","path":"/data/work/out.txt","content":"hi"}|200
+        {"op":"read","path":"/data/pub/readme.txt"}|403
+    networks: [swarm]
+
+# Workers can only reach the broker over this network — not each other's targets, not the
+# wider internet. Egress confinement is the container's job; scope is the token's job.
+networks:
+  swarm:
+    driver: bridge

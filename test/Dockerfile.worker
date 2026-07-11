@@ -1,0 +1,9 @@
+# A minimal swarm worker: it gets ONLY curl + its scoped token in the environment.
+# No source, no credentials, no tools beyond what a token-holder needs. Its sole route
+# to the owner's resources is $CAPDEL_URL, gated by $CAPDEL_TOKEN.
+FROM alpine:3.20
+RUN apk add --no-cache curl jq
+COPY worker.sh /worker.sh
+RUN chmod +x /worker.sh
+# CAPDEL_URL, CAPDEL_TOKEN, CAP_ID, and WORKER_PLAN come from the environment (compose).
+ENTRYPOINT ["/worker.sh"]

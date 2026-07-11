@@ -1,0 +1,43 @@
+#cloud-config
+# Disposable "owner machine" for capdel swarm/kernel testing. Boots a throwaway Linux VM
+# running the broker against throwaway content — so exec caps can do anything and it does
+# not matter, and (being a real VM, not a container) Landlock/seccomp/cgroups tests (#8)
+# have a real kernel to run against.
+#
+# Boot it with whatever you have:
+#   multipass:  multipass launch --name capdel --cloud-init test/cloud-init.yaml 24.04
+#   qemu:       cloud-localds seed.img test/cloud-init.yaml && qemu-system-x86_64 \
+#                 -m 2G -drive file=noble-server-cloudimg-amd64.img -drive file=seed.img,format=raw \
+#                 -netdev user,id=n,hostfwd=tcp::4571-:4571 -device virtio-net,netdev=n
+#   any cloud:  paste as user-data.
+#
+# Then the broker is on <vm-ip>:4571 with owner secret below (CHANGE IT for anything real).
+package_update: true
+packages: [python3, git, curl]
+write_files:
+  - path: /etc/capdel.env
+    permissions: "0600"
+    content: |
+      CAPDEL_OWNER_SECRET=change-me-disposable-vm-secret
+      CAPDEL_HOME=/var/lib/capdel
+  - path: /etc/systemd/system/capdel.service
+    content: |
+      [Unit]
+      Description=capdel broker (disposable test host)
+      After=network-online.target
+      [Service]
+      EnvironmentFile=/etc/capdel.env
+      ExecStart=/usr/bin/python3 /opt/capdel/capdel.py serve --bind 0.0.0.0:4571
+      Restart=on-failure
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - git clone --depth 1 https://github.com/amiller/capdel /opt/capdel
+  - install -d -m 700 /var/lib/capdel
+  - install -d /srv/demo/pub /srv/demo/work
+  - sh -c 'echo "public note" > /srv/demo/pub/readme.txt'
+  - systemctl daemon-reload
+  - systemctl enable --now capdel.service
+  # sanity: the broker is up and mintable (owner-only, over localhost)
+  - sh -c 'set -a; . /etc/capdel.env; sleep 2; python3 /opt/capdel/capdel.py mint fs --root /srv/demo/pub --ops list,read --ttl 1h --name vm-smoke | head -1'
+final_message: "capdel broker up on :4571 — mint caps for workers, or run test/swarm.py against it."
