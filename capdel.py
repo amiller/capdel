@@ -8,6 +8,7 @@ HOME = Path(os.environ.get("CAPDEL_HOME", str(Path.home() / ".capdel")))
 CAPS, REQS, AUDIT = HOME / "caps", HOME / "requests", HOME / "audit.jsonl"
 FS_OPS = {"list", "read", "write", "stat"}
 DEF_MAX_BYTES, DEF_TIMEOUT, DEF_MAX_OUTPUT = 1 << 20, 60, 1 << 18
+OWNER_SECRET = os.environ.get("CAPDEL_OWNER_SECRET")  # gates read-only /_tree, /_audit
 
 
 class Denied(Exception): pass
@@ -196,12 +197,14 @@ def net_invoke(cap, body):
 
 
 def describe(cap, base):
+    c = cap["constraints"]
+    dest = c["allow"][0] if (cap["type"] == "net" and c.get("allow")) else ["HOST", 0]
     how = {
-        "fs": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"list\",\"path\":\"{cap['constraints'].get('root','')}\"}}' {base}/caps/{cap['id']}/invoke",
+        "fs": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"list\",\"path\":\"{c.get('root','')}\"}}' {base}/caps/{cap['id']}/invoke",
                'ops: {"op":"list|read|stat","path":…} {"op":"write","path":…,"content":…}'],
         "exec": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"run\",\"argv\":[\"ls\"]}}' {base}/caps/{cap['id']}/invoke",
                  'op: {"op":"run","argv":[…],"cwd"?:…,"stdin"?:…}'],
-        "net": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{cap['constraints']['allow'][0][0]}\",\"port\":{cap['constraints']['allow'][0][1]}}}' {base}/caps/{cap['id']}/invoke",
+        "net": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}' {base}/caps/{cap['id']}/invoke",
                 'op: {"op":"connect","host":…,"port":…,"send"?:<base64>} → {recv:<base64>,bytes,truncated}; send a request with Connection: close so the peer closes'],
     }[cap["type"]]
     return {"id": cap["id"], "name": cap["name"], "type": cap["type"],
@@ -237,7 +240,14 @@ class Handler(BaseHTTPRequestHandler):
     def _base(self):
         return f"http://{self.headers.get('Host', self.server.server_address[0])}"
 
+    def _owner_ok(self):
+        return bool(OWNER_SECRET) and self._token() == OWNER_SECRET
+
     def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/_tree", "/_audit"):
+            if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
+            return self._json(200, {"tree": tree_data()} if path == "/_tree" else {"audit": audit_tail()})
         m = re.fullmatch(r"/caps/([\w-]+)", self.path)
         if m:
             cap = self._auth(m.group(1))
@@ -319,20 +329,33 @@ def fmt_constraints(cap):
     return f"net [{dests}]"
 
 
-def cmd_tree(_):
-    caps = all_caps()
+def tree_data():
     kids = {}
-    for c in caps:
+    for c in all_caps():
         kids.setdefault(c["parent"], []).append(c)
-    def walk(c, depth):
-        state = "REVOKED" if c["revoked"] else ("expired" if now() > c["expires_at"] else
-                f"expires in {(c['expires_at'] - now()) // 60}m")
-        used = f", last used {(now() - c['last_used']) // 60}m ago" if c["last_used"] else ""
-        print(f"{'  ' * depth}{c['id']}  {c['name']!r}  {fmt_constraints(c)}  [{state}{used}]")
-        for k in kids.get(c["id"], []):
+    def node(c):
+        return {"id": c["id"], "name": c["name"], "type": c["type"], "summary": fmt_constraints(c),
+                "constraints": c["constraints"], "expires_at": c["expires_at"],
+                "revoked": c["revoked"], "last_used": c["last_used"],
+                "children": [node(k) for k in kids.get(c["id"], [])]}
+    return [node(c) for c in kids.get(None, [])]
+
+
+def audit_tail(n=200):
+    if not AUDIT.exists(): return []
+    return [json.loads(l) for l in AUDIT.read_text().splitlines()[-n:]]
+
+
+def cmd_tree(_):
+    def walk(n, depth):
+        state = "REVOKED" if n["revoked"] else ("expired" if now() > n["expires_at"] else
+                f"expires in {(n['expires_at'] - now()) // 60}m")
+        used = f", last used {(now() - n['last_used']) // 60}m ago" if n["last_used"] else ""
+        print(f"{'  ' * depth}{n['id']}  {n['name']!r}  {n['summary']}  [{state}{used}]")
+        for k in n["children"]:
             walk(k, depth + 1)
-    for c in kids.get(None, []):
-        walk(c, 0)
+    for n in tree_data():
+        walk(n, 0)
 
 
 def parse_dest(s):
@@ -407,8 +430,46 @@ def cmd_audit(a):
 def cmd_serve(a):
     host, port = a.bind.rsplit(":", 1)
     srv = ThreadingHTTPServer((host, int(port)), Handler)
-    print(f"capdel broker on http://{a.bind}  (state: {HOME})", file=sys.stderr)
+    owner = "with owner endpoints (/_tree, /_audit)" if OWNER_SECRET else "no owner secret (/_tree disabled)"
+    print(f"capdel broker on http://{a.bind}  (state: {HOME}; {owner})", file=sys.stderr)
     srv.serve_forever()
+
+
+def cmd_tunnel(a):
+    # Dial-out relay client (§3.7): long-poll the pod relay for requests aimed at this
+    # broker, replay each against the LOCAL broker, post the response back. No inbound
+    # port on this machine; the broker is the only thing that enforces anything.
+    import urllib.request, urllib.error
+    relay, bid, local = a.relay.rstrip("/"), a.broker_id, f"http://{a.broker}"
+    sec = {"X-Capdel-Relay-Secret": a.secret} if a.secret else {}
+    def call(url, data=None, headers=None, method=None, timeout=40):
+        r = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        return urllib.request.urlopen(r, timeout=timeout)
+    print(f"capdel tunnel: {relay} <-> {local} as broker {bid!r}", file=sys.stderr)
+    while True:
+        try:
+            with call(f"{relay}/_pull/{bid}?wait=25", headers=sec, timeout=40) as r:
+                if r.status == 204: continue
+                job = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            print(f"pull error {e.code}: {e.read()[:200]}", file=sys.stderr); time.sleep(3); continue
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            time.sleep(3); continue
+        body = job.get("body")
+        try:
+            with call(local + job["path"], data=body.encode() if body else None,
+                      headers=job.get("headers") or {}, method=job["method"], timeout=90) as lr:
+                status, out = lr.status, lr.read().decode()
+        except urllib.error.HTTPError as e:
+            status, out = e.code, e.read().decode()
+        except Exception as e:
+            status, out = 502, json.dumps({"error": f"local broker unreachable: {e}"})
+        try:
+            call(f"{relay}/_reply/{bid}/{job['req_id']}",
+                 data=json.dumps({"status": status, "body": out}).encode(),
+                 headers={**sec, "Content-Type": "application/json"}, method="POST", timeout=15).read()
+        except Exception as e:
+            print(f"reply error: {e}", file=sys.stderr)
 
 
 def main():
@@ -416,6 +477,11 @@ def main():
     p = argparse.ArgumentParser(prog="capdel")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve"); s.add_argument("--bind", default="127.0.0.1:4571"); s.set_defaults(f=cmd_serve)
+    s = sub.add_parser("tunnel")
+    s.add_argument("--relay", required=True); s.add_argument("--broker-id", dest="broker_id", required=True)
+    s.add_argument("--broker", default="127.0.0.1:4571")
+    s.add_argument("--secret", default=os.environ.get("CAPDEL_RELAY_SECRET"))
+    s.set_defaults(f=cmd_tunnel)
     s = sub.add_parser("mint")
     s.add_argument("type", choices=["fs", "exec", "net"])
     s.add_argument("--root"); s.add_argument("--ops", default="list,read"); s.add_argument("--max-bytes", type=int, dest="max_bytes")
