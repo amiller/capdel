@@ -23,6 +23,9 @@ Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capde
 - **`pod/`** — an optional dstack pod app so a *remote* agent can exercise a capability
   back on your machine through a dial-out tunnel, plus a read-only dashboard of your grant
   tree. Not needed for local use.
+- **`docs/user-journeys.md`** — five concrete "when would I use this" stories (local
+  subagent, remote GLM worker, command-back-to-laptop, mid-task escalation, swarm
+  fan-out), each with an honest analysis of what works today vs. what's still weak.
 - **`SPEC.md`** — the full design, requirements, and a comparison to prior work.
 
 ## Walkthrough — delegate to a helper, in one screen
