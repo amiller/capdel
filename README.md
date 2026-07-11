@@ -11,6 +11,20 @@ requirements provenance.
 
 Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capdel`).
 
+## What's in here
+
+- **`capdel.py`** — the whole thing: the broker (a local reference monitor that holds
+  real fs/exec/net authority) plus the CLI (`serve`, `mint`, `tree`, `approve`, `revoke`,
+  `tunnel`).
+- **`skill/capdel/SKILL.md`** — a Claude Code skill that teaches a trusted agent to reach
+  for capdel when it dispatches a subagent (mint a narrow capability, hand over only a
+  token). Drop it in `~/.claude/skills/capdel/` to use it. **Start here to understand the
+  point.**
+- **`pod/`** — an optional dstack pod app so a *remote* agent can exercise a capability
+  back on your machine through a dial-out tunnel, plus a read-only dashboard of your grant
+  tree. Not needed for local use.
+- **`SPEC.md`** — the full design, requirements, and a comparison to prior work.
+
 ## Quickstart
 
 ```sh
