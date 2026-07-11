@@ -39,8 +39,8 @@ RESP=$(curl -fsS -X POST "$CVM/_api/projects" \
   -F "files=@$TMP/app.tgz")
 echo "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("deployed:",d["name"],"| mode:",d.get("mode"),"| tree:",d.get("tree_hash","")[:12])'
 echo
-echo "Shareable demo (public)  → $CVM/capdel-relay/demo"
-echo "Live dashboard (gated)   → $CVM/capdel-relay/?key=<relay-secret>"
+echo "Shareable mockup (public) → $CVM/capdel-relay/mockup"
+echo "Live dashboard (gated)    → $CVM/capdel-relay/?key=<relay-secret>"
 echo "On the laptop, alongside capdel serve:"
 echo "  CAPDEL_OWNER_SECRET=<owner> capdel serve"
 echo "  CAPDEL_RELAY_SECRET=<relay> capdel tunnel --relay $CVM/capdel-relay --broker-id laptop1"

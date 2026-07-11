@@ -46,9 +46,9 @@ curl -H "Authorization: Bearer <token>" \
 `CAPDEL_RELAY_SECRET` and `CAPDEL_OWNER_SECRET` to match the laptop's broker/tunnel.
 Served at `<pod>/capdel-relay/`. Two pages:
 
-- **`<pod>/capdel-relay/demo`** — a public, shareable read-only page with illustrative
-  data (chains, expiry, an approved escalation, a revoked subtree). No broker or key
-  needed; this is the link to share.
+- **`<pod>/capdel-relay/mockup`** — a public, shareable read-only page with hand-built
+  data (chains, expiry, an approved escalation, a revoked subtree) — nothing running.
+  No broker or key needed; this is the link to share for a walkthrough of the layout.
 - **`<pod>/capdel-relay/?key=<relay-secret>`** — the live dashboard, real capabilities
   pulled through the tunnel. Gated; needs a connected broker.
 

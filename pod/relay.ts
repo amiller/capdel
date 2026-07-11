@@ -49,10 +49,10 @@ function connectedBrokers(): string[] {
   return [...lastSeen.entries()].filter(([, t]) => now - t < 60000).map(([b]) => b);
 }
 
-let demoHtml: string | null = null;
-async function getDemo(): Promise<string> {
-  if (demoHtml === null) demoHtml = await Deno.readTextFile(new URL("./public/demo.html", import.meta.url));
-  return demoHtml;
+let mockupHtml: string | null = null;
+async function getMockup(): Promise<string> {
+  if (mockupHtml === null) mockupHtml = await Deno.readTextFile(new URL("./public/mockup.html", import.meta.url));
+  return mockupHtml;
 }
 
 export default async function handler(req: Request, ctx: { env: Record<string, string> }): Promise<Response> {
@@ -61,8 +61,8 @@ export default async function handler(req: Request, ctx: { env: Record<string, s
   const url = new URL(req.url);
   const path = url.pathname;
 
-  // --- public shareable demo page (no broker, no secret) ---
-  if (path === "/demo" || path === "/demo/") return html(await getDemo());
+  // --- public shareable mockup page (no broker, no secret) ---
+  if (path === "/mockup" || path === "/mockup/") return html(await getMockup());
 
   // --- laptop side: long-poll for the next request aimed at this broker ---
   if (path.startsWith("/_pull/")) {
@@ -197,7 +197,7 @@ function renderLocked(): string {
 <body style="font:15px system-ui;max-width:480px;margin:80px auto;color:#12252a">
 <h1 style="font-size:19px">capdel relay</h1>
 <p style="color:#6b8189">The live dashboard is gated. Append <code>?key=&lt;relay-secret&gt;</code> to view real capabilities,
-or see the <a href="demo" style="color:#03636a">read-only demo</a>.</p></body>`;
+or see the <a href="mockup" style="color:#03636a">read-only mockup</a>.</p></body>`;
 }
 
 // Dev harness: `deno run -A relay.ts` serves the same handler standalone for local testing.
