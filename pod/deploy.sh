@@ -17,7 +17,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 TEE_DAEMON_TOKEN="${TEE_DAEMON_TOKEN:-$(grep -E '^TEE_DAEMON_TOKEN=' "$HOME/projects/hermes-agent/deploy-notes/.env.prod9" 2>/dev/null | cut -d= -f2- || true)}"
 : "${TEE_DAEMON_TOKEN:?no daemon token (set TEE_DAEMON_TOKEN or populate .env.prod9)}"
 : "${CAPDEL_RELAY_SECRET:?set CAPDEL_RELAY_SECRET}"
-: "${CAPDEL_OWNER_SECRET:?set CAPDEL_OWNER_SECRET (must match the broker's)}"
+: "${CAPDEL_OWNER_SECRET:?set CAPDEL_OWNER_SECRET (must match the broker)}"
 
 MANIFEST=$(CAPDEL_RELAY_SECRET="$CAPDEL_RELAY_SECRET" CAPDEL_OWNER_SECRET="$CAPDEL_OWNER_SECRET" python3 - <<'PY'
 import json, os
@@ -41,7 +41,7 @@ echo "$RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("deplo
 echo
 echo "Shareable demo (public)  → $CVM/capdel-relay/demo"
 echo "Live dashboard (gated)   → $CVM/capdel-relay/?key=<relay-secret>"
-echo "On the laptop, alongside 'capdel serve':"
+echo "On the laptop, alongside capdel serve:"
 echo "  CAPDEL_OWNER_SECRET=<owner> capdel serve"
 echo "  CAPDEL_RELAY_SECRET=<relay> capdel tunnel --relay $CVM/capdel-relay --broker-id laptop1"
 echo "A remote agent then invokes at:"
