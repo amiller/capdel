@@ -503,6 +503,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError) as e:
                 return self._json(400, {"error": f"bad request: {e!r}"})
             return self._json(200, {"event": name, "closed": closed, "count": len(closed)})
+        if path == "/_gc":
+            if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
+            removed = gc_expired()
+            return self._json(200, {"cleared": len(removed), "ids": removed})
         m = re.fullmatch(r"/caps/([\w-]+)/(invoke|attenuate|escalate)", self.path)
         if not m:
             return self._json(404, {"error": "no such route"})
@@ -587,6 +591,7 @@ def tree_data():
         return {"id": c["id"], "name": c["name"], "type": c["type"], "summary": fmt_constraints(c),
                 "constraints": c["constraints"], "expires_at": c["expires_at"],
                 "revoked": c["revoked"], "last_used": c["last_used"], "closes_on": c.get("closes_on") or [],
+                "created": c.get("created"), "escalation": c.get("escalation"),
                 "children": [node(k) for k in kids.get(c["id"], [])]}
     return [node(c) for c in kids.get(None, [])]
 
@@ -594,6 +599,23 @@ def tree_data():
 def audit_tail(n=200):
     if not AUDIT.exists(): return []
     return [json.loads(l) for l in AUDIT.read_text().splitlines()[-n:]]
+
+
+def gc_expired():
+    """Delete cap files whose TTL has passed (the "clear expired" sweep, issue #7:
+    approved escalations are minted as fresh owner roots that otherwise pile up until
+    TTL and then linger as dead files). Safe because mint() clamps a child's expires_at
+    to <= its parent's, so every cap under an expired root is itself expired — nothing
+    live can lose an ancestor. Revoked-but-unexpired caps are kept (revocation is an
+    audit state; check_live already refuses them at invoke time)."""
+    removed = []
+    for c in all_caps():
+        if now() > c["expires_at"]:
+            (CAPS / f"{c['id']}.json").unlink(missing_ok=True)
+            removed.append(c["id"])
+    if removed:
+        audit(event="gc", removed=removed)
+    return removed
 
 
 def cmd_tree(_):
@@ -650,6 +672,10 @@ def cmd_approve(a):
     # was NOT in the requester's chain, so approving mints it as a fresh owner capability
     # (same power as `capdel mint`) — not a sibling clamped to the requester's ancestor.
     cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}", parse_ttl(a.ttl), pop=a.pop, closes_on=a.closes_on)
+    # Record provenance on the minted cap so the dashboard can render the grant's
+    # lineage (which request, from which cap, why) as data instead of parsing the name.
+    cap["escalation"] = {"request": req["id"], "source_cap": req["cap"], "reason": req["reason"]}
+    save(CAPS, cap)
     req.update(status="approved", token=token, minted_cap=cap["id"], decided=now())
     save(REQS, req)
     audit(event="approve", request=req["id"], cap=cap["id"])
@@ -684,6 +710,13 @@ def cmd_event(a):
         print(f"event {a.name!r}: closed {len(closed)} cap(s): {', '.join(closed)}")
     else:
         print(f"event {a.name!r}: no capabilities close on it (0 closed)")
+
+
+def cmd_gc(_):
+    removed = gc_expired()
+    word = "capability" if len(removed) == 1 else "capabilities"
+    ids = f": {', '.join(removed)}" if removed else ""
+    print(f"cleared {len(removed)} expired {word}{ids}")
 
 
 def cmd_audit(a):
@@ -771,6 +804,7 @@ def main():
     s = sub.add_parser("revoke"); s.add_argument("cap"); s.set_defaults(f=cmd_revoke)
     s = sub.add_parser("event"); s.add_argument("name", help="fire a trusted event; closes every cap whose --closes-on lists it")
     s.set_defaults(f=cmd_event)
+    s = sub.add_parser("gc"); s.set_defaults(f=cmd_gc)
     s = sub.add_parser("audit"); s.add_argument("--cap"); s.set_defaults(f=cmd_audit)
     a = p.parse_args()
     a.f(a)
