@@ -246,10 +246,13 @@ remote agent ──HTTPS──▶ pod: /capdel-relay/<broker-id>/caps/<id>/invok
   precisely because it folds remote-reach into the same token model as everything
   else.
 
-Tokens are bearer in v0; tunnel/TLS integrity is assumed from the transport (WSS +
-the pod's in-TEE cert). DPoP-style proof-of-possession is the tracked hardening
-(anti-teleport, per the delegation-landscape survey and the Tenuo trial, where a
-warrant is useless without the holder key).
+Tokens are bearer by default (v0); tunnel/TLS integrity is assumed from the transport (WSS +
+the pod's in-TEE cert). **Holder-bound proof-of-possession is implemented** as an opt-in
+HMAC-PoP scheme (`CAPDEL_POP=off|allow|require`, `capdel mint --pop`): the token becomes
+an HMAC key that never re-crosses the wire; each request signs a canonical string over
+method + broker-local path + body-hash + nonce + timestamp, so a token lifted from a relay
+log or a captured request is useless (single-use nonces). See `tasks/pop-design-hmac.md`.
+Asymmetric PoP (Ed25519, so the broker stores only a public key) is the reserved opt-in slot.
 
 ### 3.8 What the sandbox is for (R8)
 
@@ -274,8 +277,11 @@ capabilities).
   it attenuates. Root minting is offline-only.
 - **The broker is TCB.** ~600 lines of stdlib Python, no deps, no shell, realpath
   containment, prefix-matched argv. Small enough to read.
-- **Known v0 gaps**: bearer tokens (no PoP) — acute once a token transits the public
-  relay (§3.7), since the relay operator could replay it; no rate limits; fs `write`
+- **Known v0 gaps**: bearer tokens are the default but **HMAC-PoP is implemented** (`--pop` /
+  `CAPDEL_POP=require`) — the remaining gap is the *symmetric* cost: a PoP cap's secret is
+  stored at rest in `~/.capdel` (the broker must hold it to verify), so reading the state
+  dir yields usable keys (moot, since that read access already grants the real authority;
+  asymmetric Ed25519-PoP removes it); no rate limits; fs `write`
   can fill a disk within max_bytes per call; exec allowlist can't constrain flags
   beyond prefix (allow `["rg"]` and any rg flags are fair game — write tighter
   prefixes or wrap in scripts); `net` matches host literally, so it can't express
@@ -387,7 +393,9 @@ expiry inline; escalate should return poll-interval guidance (`Retry-After`); th
 Pod relay app + `capdel tunnel` (§3.7) — the concrete R4 build: a Deno oauth3 app
 that muxes remote HTTP to a laptop broker over a dial-out WSS, with the pod's own
 scoped-token gate in front. DPoP-style holder-bound tokens (§4), promoted from
-"tracked" to "needed" the moment tokens cross that relay. `net` capability
+"tracked" to "needed" the moment tokens cross that relay — **now implemented** as HMAC-PoP
+(`--pop` / `CAPDEL_POP=require`); the asymmetric Ed25519 slot (broker stores only a public
+key, cannot forge for a holder) is reserved on the same framework. `net` capability
 implementation (§3.1) beyond the spec — brokered CONNECT with per-connection audit.
 Guard scripts attached at attenuation time (arbitrary predicates beyond
 subset-shaped constraints — the "attach scripts that restrict" idea; needs its own

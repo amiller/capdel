@@ -101,8 +101,12 @@ export default async function handler(req: Request, ctx: { env: Record<string, s
     if (!connectedBrokers().includes(bid))
       return json({ error: `broker ${bid} not connected — start 'capdel tunnel' on the owner's machine` }, 502);
     const headers: Record<string, string> = {};
-    const auth = req.headers.get("authorization"); if (auth) headers["Authorization"] = auth;
-    const ct = req.headers.get("content-type"); if (ct) headers["Content-Type"] = ct;
+    const fwd = (h: string) => { const v = req.headers.get(h.toLowerCase()); if (v) headers[h] = v; };
+    fwd("Authorization"); fwd("Content-Type");
+    // PoP (issue #4): pass the holder's signature through untouched. The signed PATH is
+    // broker-local (already stripped of the /b/<id> prefix in `cpath`); the relay must
+    // not add, drop, or rewrite these, or the HMAC fails at the broker.
+    fwd("Capdel-Nonce"); fwd("Capdel-Timestamp"); fwd("Capdel-Signature");
     const body = (req.method === "GET" || req.method === "HEAD") ? null : await req.text();
     const res = await relayCall(bid, req.method, cpath + url.search, headers, body);
     recent.unshift({ ts: Date.now(), bid, method: req.method, path: cpath, status: res.status });
