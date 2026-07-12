@@ -17,15 +17,23 @@ function normalize(p: string): string {
 function encodeBase64(b: Uint8Array): string { let s = ""; for (const x of b) s += String.fromCharCode(x); return btoa(s); }
 function decodeBase64(s: string): Uint8Array { const bin = atob(s); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
 
-const HOME = Deno.env.get("CAPDEL_HOME") ?? join(Deno.env.get("HOME") ?? ".", ".capdel");
-const CAPS = join(HOME, "caps"), REQS = join(HOME, "requests"), AUDIT = join(HOME, "audit.jsonl");
 const FS_OPS = new Set(["list", "read", "write", "stat"]);
 const DEF_MAX_BYTES = 1 << 20, DEF_TIMEOUT = 60, DEF_MAX_OUTPUT = 1 << 18;
-const OWNER_SECRET = Deno.env.get("CAPDEL_OWNER_SECRET") ?? null;
-const REQUEST_TTL = parseInt(Deno.env.get("CAPDEL_REQUEST_TTL") ?? "3600");
-const POP_MODE = Deno.env.get("CAPDEL_POP") ?? "off";
 const SKEW = 300, SCHEME = "capdel-hmac-sha256";
 const COMMIT = gitCommit();
+
+// Config is injected, not read once at import — so the same module serves the CLI (from
+// Deno.env) AND a pod webhost app (from ctx.env, where Deno.env may be sandboxed away).
+let HOME: string, CAPS: string, REQS: string, AUDIT: string;
+let OWNER_SECRET: string | null, REQUEST_TTL: number, POP_MODE: string;
+export function configure(env: Record<string, string | undefined>) {
+  HOME = env.CAPDEL_HOME ?? join(env.HOME ?? "/tmp", ".capdel");
+  CAPS = join(HOME, "caps"); REQS = join(HOME, "requests"); AUDIT = join(HOME, "audit.jsonl");
+  OWNER_SECRET = env.CAPDEL_OWNER_SECRET ?? null;
+  REQUEST_TTL = parseInt(env.CAPDEL_REQUEST_TTL ?? "3600");
+  POP_MODE = env.CAPDEL_POP ?? "off";
+}
+configure((() => { try { return Deno.env.toObject(); } catch { return {}; } })());
 
 class Denied extends Error {}
 
@@ -55,7 +63,7 @@ function timingEq(a: string, b: string): boolean {
 
 // ---- state ------------------------------------------------------------------------
 const now = () => Math.floor(Date.now() / 1000);
-function ensureHome() {
+export function ensureHome() {
   for (const d of [CAPS, REQS]) Deno.mkdirSync(d, { recursive: true });
   try { Deno.chmodSync(HOME, 0o700); } catch { /* windows */ }
 }
@@ -376,7 +384,7 @@ async function authn(cid: string, method: string, path: string, body: Uint8Array
   return null;
 }
 
-async function handle(req: Request): Promise<Response> {
+export async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
   const full = url.pathname + (url.search || "");
