@@ -78,12 +78,24 @@ agent:
   "expires_at": 1783810000,          // unix; never later than parent's
   "revoked": false,
   "created_by": "cap-root-fs",       // which token minted it
+  "closes_on": ["build-passed"],   // trusted events that auto-revoke this cap (closure)
   "token_sha256": "…"                // broker stores only the hash
 }
 ```
 
 The chain `parent → child` is the delegation history; revoking a node revokes its
-whole subtree (checked at invoke time by walking ancestors).
+whole subtree (checked at invoke time by walking ancestors). Authority ends three
+ways: **TTL expiry**, **manual `revoke`**, and **closure** — a cap may declare
+`closes_on`, a set of trusted-event names; when the owner files one of those events
+the cap (and thus its subtree) auto-revokes. TTL-alone leaves authority live after
+its justification ends (the subgoal finished, the tests passed, the phase exited);
+closure ties a grant's lifetime to the reason it was granted (PORTICO). It only
+*narrows* authority, so a child may freely add events and a parent's closure cascades
+to its subtree via the same ancestor walk; the effective closure (shown in the cap
+self-description and `capdel tree`) is the union of `closes_on` up the chain. Events
+are owner-filed only (`capdel event`, or owner-secret `POST /_event`): the value is
+a signal the delegated holder *cannot* forge — a holder could already simply stop
+calling, so closure buys safety only when the firing condition is owner-asserted.
 
 ### 3.1 Capability types
 
@@ -296,6 +308,7 @@ POST /caps/<id>/attenuate   Bearer <token>   {"constraints":…, "name":…, "tt
 POST /caps/<id>/escalate    Bearer <token>   {"want":…, "reason":…}                → {request_id}
 GET  /caps/<id>             Bearer <token>                        → self-description + how
 GET  /requests/<rid>        Bearer <token of requesting cap>      → status [+ token]
+POST /_event                Bearer <owner-secret>   {"name":…}                     → {event, closed[], count}   # trusted closure
 ```
 
 fs invoke ops: `{"op":"list","path"}`, `{"op":"read","path"}`, `{"op":"write","path","content"}`,
@@ -316,6 +329,8 @@ capdel tunnel --relay https://pod…/capdel-relay --broker-id NAME   # dial out 
 capdel mint fs   --root PATH --ops list,read [--ttl 4h] [--name …]     → prints id + token
 capdel mint exec --allow "git status" --allow "ls" --cwd-root PATH …   → prints id + token
 capdel mint net  --allow "api.github.com:443" --allow "10.0.0.5:*" …   → prints id + token
+  # any mint may add [--closes-on EVENT …]: trusted events that auto-revoke the cap
+capdel event NAME           # fire a trusted event; closes every cap whose --closes-on lists it
 capdel tree | capdel audit [--cap ID] | capdel requests
 capdel approve REQ [--ttl 1h] | capdel deny REQ | capdel revoke CAP
 ```

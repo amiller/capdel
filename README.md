@@ -123,9 +123,31 @@ bearer) | `allow` (per-request) | `require` (PoP mandatory). Design:
 | `invoke` | any token holder | exercise the capability (fs: list/read/write/stat inside root; exec: allowlisted argv prefixes, no shell; net: one brokered TCP connect to an allowlisted host:port) |
 | `escalate` | any token holder | request more, with a reason; owner rules via `capdel approve/deny`; requester polls |
 | `revoke` | operator, CLI | kill a capability and its whole subtree immediately |
+| `event` | operator, CLI | fire a trusted event; auto-revokes every cap whose `--closes-on` lists it (closure) |
 
 Legibility: `capdel tree` (live grant tree = the at-a-glance exposure view),
 `capdel audit` (JSONL, every allow/deny), `capdel requests` (pending escalations).
+
+## Closure — authority dies with its justification
+
+TTL alone leaves a capability live after the reason it was granted ends. A cap may
+declare `closes_on` — trusted-event names that auto-revoke it when the owner fires
+one (`capdel event NAME`, or owner-secret `POST /_event`). PORTICO-style: tie a
+grant's lifetime to the reason it was granted.
+
+```sh
+# grant a helper read access that dies the moment the build passes
+python3 capdel.py mint fs --root ~/work --ops list,read --ttl 4h \
+  --closes-on build-passed --name helper
+# …later, the owner verifies the build and fires the event — the cap (and any
+# children) is revoked automatically; nothing waits around for TTL.
+python3 capdel.py event build-passed
+```
+
+Closure only narrows authority: a child may add events, a parent's closure cascades
+to its subtree, and the effective closure is the union up the chain (shown in the
+cap self-description and `capdel tree`). Events are owner-filed only — the value is
+a signal a delegated holder *cannot* forge.
 
 ## Trying it on a subagent
 
