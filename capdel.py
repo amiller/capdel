@@ -148,6 +148,36 @@ def check_live(cap):
         c = load(CAPS, c["parent"]) if c["parent"] else None
 
 
+def effective_closes_on(cap):
+    """Union of closes_on along the ancestor chain — the events that would close this cap,
+    whether declared on it or inherited (a parent closing revokes its whole subtree)."""
+    evs, c = set(), cap
+    while c:
+        evs |= set(c.get("closes_on") or [])
+        c = load(CAPS, c["parent"]) if c["parent"] else None
+    return sorted(evs)
+
+
+def fire_event(name):
+    """Close (revoke) every non-revoked cap whose closes_on lists `name`. This is the trusted
+    closure primitive (PORTICO): a cap's authority dies with the reason it was granted. Only the
+    owner files events (CLI or owner-secret /_event) — a delegated holder must not be able to
+    forge the 'tests passed' signal that justifies continued authority. Children whose closure
+    comes only from an ancestor die via check_live's ancestor walk; marking the ancestor is enough."""
+    if not re.fullmatch(r"[\w.:-]+", name or ""):
+        raise Denied("event name must match [\\w.:-]+")
+    closed = []
+    for c in all_caps():
+        if c.get("revoked"):
+            continue
+        if name in (c.get("closes_on") or []):
+            c["revoked"] = True
+            save(CAPS, c)
+            closed.append(c["id"])
+    audit(event="close_event", name=name, closed=closed)
+    return closed
+
+
 def resolve_inside(root, path):
     rp, rroot = os.path.realpath(path), os.path.realpath(root)
     if os.path.commonpath([rroot, rp]) != rroot:
@@ -212,8 +242,20 @@ def check_subset(type_, child, parent_cap):
             raise Denied("timeout_s exceeds parent's")
 
 
-def mint(type_, constraints, name, ttl_s, parent=None, pop=False):
+def validate_closes_on(events):
+    """Closure predicate: trusted-event names that auto-revoke this cap when filed by the
+    owner. Closure only NARROWS authority (ends a grant earlier), so a child may freely add
+    events; a parent's closure still cascades to its subtree via check_live's ancestor walk."""
+    if events is None:
+        return []
+    if not isinstance(events, list) or not all(isinstance(e, str) and re.fullmatch(r"[\w.:-]+", e) for e in events):
+        raise Denied("closes_on must be a list of event-name strings (letters/digits/_/./:/-)")
+    return sorted(set(events))
+
+
+def mint(type_, constraints, name, ttl_s, parent=None, pop=False, closes_on=None):
     validate_constraints(type_, constraints)
+    closes_on = validate_closes_on(closes_on)
     expires = now() + ttl_s
     if parent:
         check_live(parent)
@@ -236,11 +278,12 @@ def mint(type_, constraints, name, ttl_s, parent=None, pop=False):
     cap = {"id": cid, "parent": parent["id"] if parent else None,
            "name": name, "type": type_, "constraints": constraints, "expires_at": expires,
            "revoked": False, "token_sha256": tok_sha, "created": now(), "last_used": None,
-           "pop": bool(pop)}
+           "pop": bool(pop), "closes_on": closes_on}
     if secret is not None:
         cap["secret"] = secret                            # bearer caps store only the hash
     save(CAPS, cap)
-    audit(event="mint", cap=cap["id"], parent=cap["parent"], name=name, constraints=constraints, pop=bool(pop))
+    audit(event="mint", cap=cap["id"], parent=cap["parent"], name=name, constraints=constraints,
+          pop=bool(pop), closes_on=closes_on)
     return cap, token
 
 
@@ -348,6 +391,8 @@ def describe(cap, base):
         out = {"id": cap["id"], "name": cap["name"], "type": cap["type"],
                "constraints": cap["constraints"], "expires_at": cap["expires_at"],
                "auth": "bearer", "how": how}
+    # Effective closure = this cap's events ∪ ancestors' (a parent closing kills the subtree).
+    out["closes_on"] = effective_closes_on(cap)
     out["escalate"] = f'POST {base}/caps/{cap["id"]}/escalate {{"want":{{just the fields to change, e.g. add an op}},"reason":…}} → poll GET {base}/requests/<request_id>; on approval the poll returns a NEW token+cap to switch to'
     return out
 
@@ -370,6 +415,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n)) if n else {}
 
     def _token(self):
         return (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
@@ -439,6 +488,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "no such route"})
 
     def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/_event":
+            # Trusted closure (§3.6): owner-filed only. A delegated holder must not be able to
+            # forge the event that ends its own authority (or DoS a peer's), so this needs the
+            # owner secret just like /_tree and /_audit.
+            if not self._owner_ok():
+                return self._json(401, {"error": "owner secret required (closure events are owner-filed — a delegated holder cannot forge them)"})
+            name = self._body().get("name")
+            try:
+                closed = fire_event(name)
+            except Denied as e:
+                return self._json(400, {"error": "denied", "violated": str(e)})
+            except (ValueError, TypeError) as e:
+                return self._json(400, {"error": f"bad request: {e!r}"})
+            return self._json(200, {"event": name, "closed": closed, "count": len(closed)})
         m = re.fullmatch(r"/caps/([\w-]+)/(invoke|attenuate|escalate)", self.path)
         if not m:
             return self._json(404, {"error": "no such route"})
@@ -465,9 +529,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == "attenuate":
                 child_pop = bool(cap.get("pop")) or ("secret" in cap)   # a PoP parent begets PoP children
                 child, token = mint(cap["type"], body["constraints"], body.get("name", f"child of {cap['id']}"),
-                                    int(body.get("ttl_s", 3600)), parent=cap, pop=child_pop)
+                                    int(body.get("ttl_s", 3600)), parent=cap, pop=child_pop, closes_on=body.get("closes_on"))
                 return self._json(200, {"id": child["id"], "token": token, "expires_at": child["expires_at"],
-                                        "pop": child.get("pop", False)})
+                                        "pop": child.get("pop", False), "closes_on": child.get("closes_on", [])})
             # `want` may be a delta — merge it onto the cap's current constraints so a
             # holder can ask for just the extra op/host without restating root/cwd_root.
             want = {**cap["constraints"], **(body.get("want") or {})}
@@ -522,7 +586,7 @@ def tree_data():
     def node(c):
         return {"id": c["id"], "name": c["name"], "type": c["type"], "summary": fmt_constraints(c),
                 "constraints": c["constraints"], "expires_at": c["expires_at"],
-                "revoked": c["revoked"], "last_used": c["last_used"],
+                "revoked": c["revoked"], "last_used": c["last_used"], "closes_on": c.get("closes_on") or [],
                 "children": [node(k) for k in kids.get(c["id"], [])]}
     return [node(c) for c in kids.get(None, [])]
 
@@ -533,15 +597,17 @@ def audit_tail(n=200):
 
 
 def cmd_tree(_):
-    def walk(n, depth):
+    def walk(n, depth, inherited):
         state = "REVOKED" if n["revoked"] else ("expired" if now() > n["expires_at"] else
                 f"expires in {(n['expires_at'] - now()) // 60}m")
         used = f", last used {(now() - n['last_used']) // 60}m ago" if n["last_used"] else ""
-        print(f"{'  ' * depth}{n['id']}  {n['name']!r}  {n['summary']}  [{state}{used}]")
+        eff = sorted(set(inherited) | set(n.get("closes_on") or []))   # effective closure incl. ancestors
+        closes = f", closes-on:{','.join(eff)}" if eff else ""
+        print(f"{'  ' * depth}{n['id']}  {n['name']!r}  {n['summary']}  [{state}{used}{closes}]")
         for k in n["children"]:
-            walk(k, depth + 1)
+            walk(k, depth + 1, eff)
     for n in tree_data():
-        walk(n, 0)
+        walk(n, 0, set())
 
 
 def parse_dest(s):
@@ -562,7 +628,7 @@ def cmd_mint(a):
         constraints = {"allow": [parse_dest(al) for al in a.allow]}
         if a.max_bytes: constraints["max_bytes"] = a.max_bytes
         if a.timeout: constraints["timeout_s"] = a.timeout
-    cap, token = mint(a.type, constraints, a.name, parse_ttl(a.ttl), pop=a.pop)
+    cap, token = mint(a.type, constraints, a.name, parse_ttl(a.ttl), pop=a.pop, closes_on=a.closes_on)
     print(f"id={cap['id']}\ntoken={token}\nexpires_at={cap['expires_at']}")
 
 
@@ -583,7 +649,7 @@ def cmd_approve(a):
     # The owner is the root of authority. An escalation exists because the needed grant
     # was NOT in the requester's chain, so approving mints it as a fresh owner capability
     # (same power as `capdel mint`) — not a sibling clamped to the requester's ancestor.
-    cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}", parse_ttl(a.ttl), pop=a.pop)
+    cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}", parse_ttl(a.ttl), pop=a.pop, closes_on=a.closes_on)
     req.update(status="approved", token=token, minted_cap=cap["id"], decided=now())
     save(REQS, req)
     audit(event="approve", request=req["id"], cap=cap["id"])
@@ -606,6 +672,18 @@ def cmd_revoke(a):
     save(CAPS, cap)
     audit(event="revoke", cap=cap["id"])
     print(f"revoked {cap['id']} (and its whole subtree, checked at invoke time)")
+
+
+def cmd_event(a):
+    # Owner-filed trusted closure (§3.6): every cap whose closes_on lists this event auto-revokes.
+    try:
+        closed = fire_event(a.name)
+    except Denied as e:
+        raise SystemExit(str(e))
+    if closed:
+        print(f"event {a.name!r}: closed {len(closed)} cap(s): {', '.join(closed)}")
+    else:
+        print(f"event {a.name!r}: no capabilities close on it (0 closed)")
 
 
 def cmd_audit(a):
@@ -679,13 +757,20 @@ def main():
     s.add_argument("--allow", action="append", default=[]); s.add_argument("--cwd-root", dest="cwd_root"); s.add_argument("--timeout", type=int)
     s.add_argument("--ttl", default="4h"); s.add_argument("--name", default="root grant")
     s.add_argument("--pop", action="store_true", help="mint a PoP cap: token is an HMAC key that never re-crosses the wire")
+    s.add_argument("--closes-on", dest="closes_on", action="append", default=[],
+                   help="trusted event name that auto-revokes this cap when the owner fires `capdel event NAME` (repeatable)")
     s.set_defaults(f=cmd_mint)
     s = sub.add_parser("tree"); s.set_defaults(f=cmd_tree)
     s = sub.add_parser("requests"); s.set_defaults(f=cmd_requests)
     s = sub.add_parser("approve"); s.add_argument("request"); s.add_argument("--ttl", default="1h")
-    s.add_argument("--pop", action="store_true", help="mint the approved cap as PoP"); s.set_defaults(f=cmd_approve)
+    s.add_argument("--pop", action="store_true", help="mint the approved cap as PoP")
+    s.add_argument("--closes-on", dest="closes_on", action="append", default=[],
+                   help="trusted event name that auto-revokes the approved cap when fired (repeatable)")
+    s.set_defaults(f=cmd_approve)
     s = sub.add_parser("deny"); s.add_argument("request"); s.set_defaults(f=cmd_deny)
     s = sub.add_parser("revoke"); s.add_argument("cap"); s.set_defaults(f=cmd_revoke)
+    s = sub.add_parser("event"); s.add_argument("name", help="fire a trusted event; closes every cap whose --closes-on lists it")
+    s.set_defaults(f=cmd_event)
     s = sub.add_parser("audit"); s.add_argument("--cap"); s.set_defaults(f=cmd_audit)
     a = p.parse_args()
     a.f(a)
