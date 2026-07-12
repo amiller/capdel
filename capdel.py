@@ -146,10 +146,13 @@ def fs_invoke(cap, body):
         st = os.stat(rp)
         return {"size": st.st_size, "mtime": int(st.st_mtime), "is_dir": os.path.isdir(rp)}
     if op == "read":
-        data = Path(rp).read_bytes()
+        off, length = int(body.get("offset", 0)), body.get("length")
+        with open(rp, "rb") as f:
+            f.seek(off)
+            data = f.read(max_bytes + 1 if length is None else min(int(length), max_bytes + 1))
         if len(data) > max_bytes:
-            raise Denied(f"file is {len(data)}B, over max_bytes {max_bytes}")
-        return {"content": data.decode("utf-8", "replace")}
+            raise Denied(f"read of {len(data)}B over max_bytes {max_bytes}; pass a smaller length or read in offset windows")
+        return {"content": data.decode("utf-8", "replace"), "offset": off, "bytes": len(data)}
     data = body["content"].encode()
     if len(data) > max_bytes:
         raise Denied(f"write of {len(data)}B is over max_bytes {max_bytes}")
@@ -199,7 +202,8 @@ def describe(cap, base):
     dest = c["allow"][0] if (cap["type"] == "net" and c.get("allow")) else ["HOST", 0]
     how = {
         "fs": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"list\",\"path\":\"{c.get('root','')}\"}}' {base}/caps/{cap['id']}/invoke",
-               'ops: {"op":"list|read|stat","path":…} {"op":"write","path":…,"content":…}'],
+               f"you may: {', '.join(c.get('ops', []))}. shapes: "
+               '{"op":"list|stat","path":…} {"op":"read","path":…,"offset"?:…,"length"?:…} {"op":"write","path":…,"content":…}'],
         "exec": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"run\",\"argv\":[\"ls\"]}}' {base}/caps/{cap['id']}/invoke",
                  'op: {"op":"run","argv":[…],"cwd"?:…,"stdin"?:…}'],
         "net": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}' {base}/caps/{cap['id']}/invoke",
@@ -259,8 +263,10 @@ class Handler(BaseHTTPRequestHandler):
             req = load(REQS, m.group(1))
             if not req: return self._json(404, {"error": "unknown request"})
             cap = load(CAPS, req["cap"])
+            if not self._token():
+                return self._json(401, {"error": "polling a request needs the SAME token you escalated with — send 'Authorization: Bearer <that token>'"})
             if not cap or sha(self._token()) != cap["token_sha256"]:
-                return self._json(401, {"error": "token does not own this request"})
+                return self._json(401, {"error": "that token does not match the cap that filed this request"})
             out = {"request_id": req["id"], "status": req["status"]}
             if req["status"] == "approved":
                 out.update(token=req["token"], cap=req["minted_cap"])
@@ -300,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"request_id": req["id"], "status": "pending",
                                     "granted_if_approved": want,
                                     "note": "if approved, poll returns a NEW token + cap id — switch to them; your current token is unchanged",
-                                    "poll": f"GET {self._base()}/requests/{req['id']}"})
+                                    "poll": f"GET {self._base()}/requests/{req['id']} — send THIS cap's token: -H 'Authorization: Bearer <token>'"})
         except Denied as e:
             audit(event=action, cap=cap["id"], op=self.path, decision="deny", violated=str(e))
             return self._json(403, {"error": "denied", "violated": str(e)})
