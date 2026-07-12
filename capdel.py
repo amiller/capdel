@@ -207,6 +207,11 @@ def validate_constraints(type_, c):
         if not allow or not all(isinstance(a, list) and len(a) == 2 and isinstance(a[0], str)
                                 and isinstance(a[1], int) and a[1] >= 0 for a in allow):
             raise Denied("net 'allow' must be a non-empty list of [host, port] (port int, 0=any)")
+    elif type_ == "llm":
+        if not c.get("models") or not all(isinstance(m, str) for m in c["models"]):
+            raise Denied("llm 'models' must be a non-empty list of model-name strings")
+        if "max_tokens" in c and not (isinstance(c["max_tokens"], int) and c["max_tokens"] > 0):
+            raise Denied("llm 'max_tokens' must be a positive int")
     else:
         raise Denied(f"unknown capability type {type_!r}")
 
@@ -232,7 +237,7 @@ def check_subset(type_, child, parent_cap):
             raise Denied("timeout_s exceeds parent's")
         if child.get("max_output", DEF_MAX_OUTPUT) > p.get("max_output", DEF_MAX_OUTPUT):
             raise Denied("max_output exceeds parent's")
-    else:  # net
+    elif type_ == "net":
         for ch, cp in child["allow"]:
             if not any(ph == ch and (pp == 0 or pp == cp) for ph, pp in p["allow"]):
                 raise Denied(f"destination [{ch}, {cp}] not covered by parent allow {p['allow']}")
@@ -240,6 +245,13 @@ def check_subset(type_, child, parent_cap):
             raise Denied("max_bytes exceeds parent's")
         if child.get("timeout_s", DEF_TIMEOUT) > p.get("timeout_s", DEF_TIMEOUT):
             raise Denied("timeout_s exceeds parent's")
+    else:  # llm
+        extra = set(child["models"]) - set(p["models"])
+        if extra: raise Denied(f"models {sorted(extra)} exceed parent models {p['models']}")
+        if child.get("max_tokens", 1 << 30) > p.get("max_tokens", 1 << 30):
+            raise Denied("max_tokens exceeds parent's")
+        if child.get("base_url", p.get("base_url")) != p.get("base_url"):
+            raise Denied("base_url may not differ from parent's")
 
 
 def validate_closes_on(events):
@@ -353,6 +365,37 @@ def net_invoke(cap, body):
             "truncated": total >= max_bytes}
 
 
+def llm_invoke(cap, body):
+    # Wrap a shared LLM key: the broker holds it (env CAPDEL_LLM_KEY) and INJECTS it into the
+    # outbound request. The holder sends only {op:"chat", model, messages} and never sees the key.
+    import urllib.request, urllib.error
+    c = cap["constraints"]
+    if body.get("op") != "chat":
+        raise Denied(f"op {body.get('op')!r} not supported; llm op is 'chat'")
+    key = os.environ.get("CAPDEL_LLM_KEY")
+    if not key:
+        raise Denied("broker has no CAPDEL_LLM_KEY configured — cannot exercise an llm cap")
+    model = body.get("model") or c["models"][0]
+    if model not in c["models"]:
+        raise Denied(f"model {model!r} not in allowed models {c['models']}")
+    if not isinstance(body.get("messages"), list) or not body["messages"]:
+        raise Denied("'messages' must be a non-empty list")
+    base = c.get("base_url") or os.environ.get("CAPDEL_LLM_BASE_URL") or "https://api.z.ai/api/coding/paas/v4"
+    payload = {"model": model, "messages": body["messages"], "temperature": body.get("temperature", 0)}
+    cap_max, req_max = c.get("max_tokens"), body.get("max_tokens")
+    if cap_max or req_max:
+        payload["max_tokens"] = min(req_max or cap_max, cap_max or req_max)
+    req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"content-type": "application/json", "authorization": f"Bearer {key}"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=c.get("timeout_s", 60)) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Denied(f"llm upstream {e.code}: {e.read()[:200].decode(errors='replace')}")
+
+
 def describe(cap, base):
     c, cpath = cap["constraints"], f"/caps/{cap['id']}"
     if cap.get("pop"):  # PoP cap: `how` bootstraps the capdel-sign helper (no Bearer on the wire)
@@ -363,6 +406,9 @@ def describe(cap, base):
         elif cap["type"] == "exec":
             ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"run\",\"argv\":[\"ls\"]}}'",
                   'op: {"op":"run","argv":[…],"cwd"?:…,"stdin"?:…}']
+        elif cap["type"] == "llm":
+            ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"chat\",\"model\":\"{(c.get('models') or ['MODEL'])[0]}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'",
+                  'op: {"op":"chat","model":…,"messages":[…],"max_tokens"?:…} (broker injects the shared key)']
         else:
             dest = c["allow"][0] if c.get("allow") else ["HOST", 0]
             ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}'",
@@ -387,6 +433,8 @@ def describe(cap, base):
                      'op: {"op":"run","argv":[…],"cwd"?:…,"stdin"?:…}'],
             "net": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}' {base}/caps/{cap['id']}/invoke",
                     'op: {"op":"connect","host":…,"port":…,"send"?:<base64>} → {recv:<base64>,bytes,truncated}; send a request with Connection: close so the peer closes'],
+            "llm": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"chat\",\"model\":\"{(c.get('models') or ['MODEL'])[0]}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}' {base}/caps/{cap['id']}/invoke",
+                    f"you may call models {c.get('models', [])} (the broker injects the shared key; you never see it). op: {{\"op\":\"chat\",\"model\":…,\"messages\":[…],\"max_tokens\"?:…}} → OpenAI-shaped completion"],
         }[cap["type"]]
         out = {"id": cap["id"], "name": cap["name"], "type": cap["type"],
                "constraints": cap["constraints"], "expires_at": cap["expires_at"],
@@ -524,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else {}
             check_live(cap)
             if action == "invoke":
-                result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke}[cap["type"]](cap, body)
+                result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke, "llm": llm_invoke}[cap["type"]](cap, body)
                 cap["last_used"] = now()
                 save(CAPS, cap)
                 audit(event="invoke", cap=cap["id"], op=body.get("op"),
@@ -579,6 +627,9 @@ def fmt_constraints(cap):
         return f"fs {','.join(c['ops'])} {c['root']}"
     if cap["type"] == "exec":
         return f"exec [{' | '.join(' '.join(a) for a in c['allow'])}] cwd={c['cwd_root']}"
+    if cap["type"] == "llm":
+        mt = f" ≤{c['max_tokens']}tok" if c.get("max_tokens") else ""
+        return f"llm [{','.join(c['models'])}]{mt}"
     dests = ', '.join(f"{h}:{p if p else '*'}" for h, p in c["allow"])
     return f"net [{dests}]"
 
@@ -646,9 +697,14 @@ def cmd_mint(a):
     elif a.type == "exec":
         constraints = {"allow": [al.split() for al in a.allow], "cwd_root": os.path.realpath(a.cwd_root)}
         if a.timeout: constraints["timeout_s"] = a.timeout
-    else:  # net
+    elif a.type == "net":
         constraints = {"allow": [parse_dest(al) for al in a.allow]}
         if a.max_bytes: constraints["max_bytes"] = a.max_bytes
+        if a.timeout: constraints["timeout_s"] = a.timeout
+    else:  # llm
+        constraints = {"models": [m for al in a.models for m in al.split(",")]}
+        if a.base_url: constraints["base_url"] = a.base_url
+        if a.max_tokens: constraints["max_tokens"] = a.max_tokens
         if a.timeout: constraints["timeout_s"] = a.timeout
     cap, token = mint(a.type, constraints, a.name, parse_ttl(a.ttl), pop=a.pop, closes_on=a.closes_on)
     print(f"id={cap['id']}\ntoken={token}\nexpires_at={cap['expires_at']}")
@@ -785,9 +841,12 @@ def main():
     s.add_argument("--secret", default=os.environ.get("CAPDEL_RELAY_SECRET"))
     s.set_defaults(f=cmd_tunnel)
     s = sub.add_parser("mint")
-    s.add_argument("type", choices=["fs", "exec", "net"])
+    s.add_argument("type", choices=["fs", "exec", "net", "llm"])
     s.add_argument("--root"); s.add_argument("--ops", default="list,read"); s.add_argument("--max-bytes", type=int, dest="max_bytes")
     s.add_argument("--allow", action="append", default=[]); s.add_argument("--cwd-root", dest="cwd_root"); s.add_argument("--timeout", type=int)
+    s.add_argument("--models", action="append", default=[], help="llm: allowed model name(s), repeatable or comma-sep")
+    s.add_argument("--base-url", dest="base_url", help="llm: OpenAI-compatible base (default z.ai coding paas)")
+    s.add_argument("--max-tokens", type=int, dest="max_tokens", help="llm: cap max_tokens per call")
     s.add_argument("--ttl", default="4h"); s.add_argument("--name", default="root grant")
     s.add_argument("--pop", action="store_true", help="mint a PoP cap: token is an HMAC key that never re-crosses the wire")
     s.add_argument("--closes-on", dest="closes_on", action="append", default=[],

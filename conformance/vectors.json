@@ -1,0 +1,105 @@
+{
+  "_comment": "Language-neutral conformance vectors for capdel. Driven over HTTP by conformance/run.py against ANY spec-compatible broker (python | deno). $VARS are filled by the runner: $ROOT (workspace dir), $FILE ($ROOT/note.txt = 'hello\\n'), $SUB ($ROOT/sub), $ESCAPE ($ROOT/../escapee), $TCP_HOST/$TCP_PORT (a local echo server). Assertions: status (HTTP code), allow (decision), violated (a 'violated' field present on denies), has (result keys present), equals (result field == value). Same vectors + same verdicts on both impls == the spec is unambiguous on this surface; a divergence is a spec bug or an impl bug.",
+  "scenarios": [
+    {
+      "name": "fs: mint, list, read, write, path-escape",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "fs_rw", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["list", "read", "write", "stat"]}, "expect": {"status": 200, "has": ["id", "token"]}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 200, "has": ["entries"]}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 200, "equals": {"content": "hello\n"}}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "stat", "path": "$FILE"}, "expect": {"status": 200, "has": ["size", "is_dir"]}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "write", "path": "$SUB/new.txt", "content": "written\n"}, "expect": {"status": 200, "equals": {"created": true, "written": 8}}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "read", "path": "$ESCAPE"}, "expect": {"status": 403, "violated": true}},
+        {"do": "invoke", "cap": "fs_rw", "body": {"op": "read", "path": "$ROOT/../../etc/hostname"}, "expect": {"status": 403, "violated": true}}
+      ]
+    },
+    {
+      "name": "fs: attenuation subset rules (narrow ok, widen denied)",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "fs_ro", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["list", "read"]}, "expect": {"status": 200}},
+        {"do": "attenuate", "cap": "fs_ro", "name": "fs_child", "constraints": {"root": "$SUB", "ops": ["read"]}, "expect": {"status": 200, "has": ["id", "token"]}},
+        {"do": "invoke", "cap": "fs_child", "body": {"op": "read", "path": "$SUB/child.txt"}, "expect": {"status": 200}},
+        {"do": "attenuate", "cap": "fs_ro", "constraints": {"root": "$ROOT", "ops": ["read", "write"]}, "expect": {"status": 403, "violated": true, "note": "widen ops write not in parent"}},
+        {"do": "attenuate", "cap": "fs_ro", "constraints": {"root": "$ROOT/..", "ops": ["read"]}, "expect": {"status": 403, "violated": true, "note": "root escapes parent"}},
+        {"do": "invoke", "cap": "fs_child", "body": {"op": "list", "path": "$SUB"}, "expect": {"status": 403, "violated": true, "note": "child never had list"}},
+        {"do": "invoke", "cap": "fs_child", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403, "violated": true, "note": "$FILE is above child root $SUB"}}
+      ]
+    },
+    {
+      "name": "exec: prefix match, cwd containment",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "ex", "type": "exec", "constraints": {"allow": [["echo"], ["true"]], "cwd_root": "$ROOT"}, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "ex", "body": {"op": "run", "argv": ["echo", "hi"]}, "expect": {"status": 200, "equals": {"code": 0, "stdout": "hi\n"}}},
+        {"do": "invoke", "cap": "ex", "body": {"op": "run", "argv": ["cat", "$FILE"]}, "expect": {"status": 403, "violated": true, "note": "cat not an allowed prefix"}},
+        {"do": "attenuate", "cap": "ex", "name": "ex_child", "constraints": {"allow": [["echo", "safe"]], "cwd_root": "$ROOT"}, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "ex_child", "body": {"op": "run", "argv": ["echo", "safe", "now"]}, "expect": {"status": 200, "equals": {"stdout": "safe now\n"}}},
+        {"do": "invoke", "cap": "ex_child", "body": {"op": "run", "argv": ["echo", "other"]}, "expect": {"status": 403, "violated": true, "note": "does not extend [echo safe]"}},
+        {"do": "attenuate", "cap": "ex", "constraints": {"allow": [["rm"]], "cwd_root": "$ROOT"}, "expect": {"status": 403, "violated": true, "note": "rm not a parent prefix"}}
+      ]
+    },
+    {
+      "name": "net: destination allow/deny + attenuation",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "net", "type": "net", "constraints": {"allow": [["$TCP_HOST", "$TCP_PORT"]]}, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "net", "body": {"op": "connect", "host": "$TCP_HOST", "port": "$TCP_PORT"}, "expect": {"status": 200, "has": ["recv", "bytes"]}},
+        {"do": "invoke", "cap": "net", "body": {"op": "connect", "host": "10.255.255.1", "port": "$TCP_PORT"}, "expect": {"status": 403, "violated": true, "note": "host not allowed"}},
+        {"do": "invoke", "cap": "net", "body": {"op": "connect", "host": "$TCP_HOST", "port": 65000}, "expect": {"status": 403, "violated": true, "note": "port not allowed"}},
+        {"do": "invoke", "cap": "net", "body": {"op": "sniff", "host": "$TCP_HOST", "port": "$TCP_PORT"}, "expect": {"status": 403, "violated": true, "note": "only connect is a net op"}},
+        {"do": "attenuate", "cap": "net", "constraints": {"allow": [["$TCP_HOST", 0]]}, "expect": {"status": 403, "violated": true, "note": "widen port to any denied"}},
+        {"do": "attenuate", "cap": "net", "constraints": {"allow": [["evil.example", "$TCP_PORT"]]}, "expect": {"status": 403, "violated": true, "note": "widen host denied"}}
+      ]
+    },
+    {
+      "name": "pop: signed requests, tamper/replay/stale rejected",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "p", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["list", "read"]}, "pop": true, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "p", "sign": true, "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 200, "equals": {"content": "hello\n"}}},
+        {"do": "describe", "cap": "p", "sign": true, "expect": {"status": 200, "equals": {"auth": "pop-hmac-sha256"}}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "body", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "path", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "method", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "nonce", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "stale", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403}},
+        {"do": "invoke", "cap": "p", "sign": true, "tamper": "replay", "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 403, "note": "second use of same nonce"}},
+        {"do": "invoke", "cap": "p", "bearer": true, "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403, "note": "a --pop cap forces PoP; bearer rejected"}},
+        {"do": "attenuate", "cap": "p", "name": "p_child", "sign": true, "constraints": {"root": "$ROOT", "ops": ["read"]}, "expect": {"status": 200, "equals": {"pop": true}}},
+        {"do": "invoke", "cap": "p_child", "sign": true, "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 200, "note": "child key derivable from parent (mode b)"}}
+      ]
+    },
+    {
+      "name": "escalate: denied op -> escalate -> owner approve -> new cap works",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "lo", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["read"]}, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "lo", "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 403, "violated": true}},
+        {"do": "escalate", "cap": "lo", "name": "esc", "want": {"ops": ["read", "list"]}, "reason": "need to enumerate", "expect": {"status": 200, "equals": {"status": "pending"}}},
+        {"do": "approve", "req": "esc", "name": "granted", "expect": {"ok": true}},
+        {"do": "invoke", "cap": "granted", "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 200, "has": ["entries"], "note": "fresh owner grant has list"}}
+      ]
+    },
+    {
+      "name": "closure: owner event revokes the subtree",
+      "pop_mode": "allow",
+      "steps": [
+        {"do": "mint", "name": "cl", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["read"]}, "closes_on": ["tests.done"], "expect": {"status": 200}},
+        {"do": "invoke", "cap": "cl", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 200}},
+        {"do": "event", "name": "tests.done", "expect": {"ok": true}},
+        {"do": "invoke", "cap": "cl", "body": {"op": "read", "path": "$FILE"}, "expect": {"status": 403, "violated": true, "note": "closed by trusted event"}}
+      ]
+    },
+    {
+      "name": "require mode: bearer rejected, PoP accepted",
+      "pop_mode": "require",
+      "steps": [
+        {"do": "mint", "name": "rq", "type": "fs", "constraints": {"root": "$ROOT", "ops": ["list", "read"]}, "pop": true, "expect": {"status": 200}},
+        {"do": "invoke", "cap": "rq", "bearer": true, "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 403, "note": "require rejects bearer"}},
+        {"do": "invoke", "cap": "rq", "sign": true, "body": {"op": "list", "path": "$ROOT"}, "expect": {"status": 200, "has": ["entries"]}}
+      ]
+    }
+  ]
+}
