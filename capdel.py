@@ -555,6 +555,19 @@ class Handler(BaseHTTPRequestHandler):
             if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
             removed = gc_expired()
             return self._json(200, {"cleared": len(removed), "ids": removed})
+        if path == "/_mint":
+            # owner-gated HTTP mint (symmetric with the CLI; lets the whole protocol be
+            # driven over HTTP, e.g. from a pod where there is no shell to run `capdel mint`).
+            if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
+            b = self._body()
+            try:
+                cap, token = mint(b["type"], b["constraints"], b.get("name", "root grant"),
+                                  int(b.get("ttl_s", 14400)), pop=bool(b.get("pop")), closes_on=b.get("closes_on"))
+                return self._json(200, {"id": cap["id"], "token": token, "expires_at": cap["expires_at"], "pop": cap["pop"]})
+            except Denied as e:
+                return self._json(403, {"error": "denied", "violated": str(e)})
+            except (KeyError, ValueError, TypeError) as e:
+                return self._json(400, {"error": f"bad request: {e!r}"})
         m = re.fullmatch(r"/caps/([\w-]+)/(invoke|attenuate|escalate)", self.path)
         if not m:
             return self._json(404, {"error": "no such route"})
