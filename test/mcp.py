@@ -135,6 +135,16 @@ def main():
                   d.get("id", "").startswith("cap-") and d.get("id") != cid and d.get("token", "").startswith("ct-")
                   and not r["result"].get("isError"), d)
 
+            # 7b. attenuate with ONLY constraints (no name/ttl_s): the wrapper must omit absent
+            #     optional keys — a present {"ttl_s": null} defeated the broker default → 400 TypeError.
+            r = mcp(proc, {"jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                           "params": {"name": "attenuate",
+                                      "arguments": {"constraints": {"root": str(pub), "ops": ["read"]}}}})
+            d = text_of(r)
+            check("attenuate (ttl_s/name omitted): still mints a child, not a 400",
+                  d.get("id", "").startswith("cap-") and d.get("token", "").startswith("ct-")
+                  and not r["result"].get("isError"), d)
+
             # 8. escalate → request_id, pending
             r = mcp(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                            "params": {"name": "escalate",
@@ -163,6 +173,16 @@ def main():
             # server survives: a follow-up request still answers
             r = mcp(proc, {"jsonrpc": "2.0", "id": 11, "method": "ping"})
             check("server survives the malformed line", r and r.get("id") == 11 and "result" in r, r)
+
+            # 12. a transport/local failure must surface as a tool error, never a masked success.
+            #     (a status-0 broker-unreachable result was reported isError=false.)
+            dead = subprocess.Popen([sys.executable, MCP], text=True, bufsize=1,
+                                    env={**os.environ, "CAPDEL_URL": "http://127.0.0.1:1", "CAPDEL_TOKEN": token, "CAP_ID": cid},
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            mcp(dead, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+            r = mcp(dead, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "describe", "arguments": {}}})
+            check("broker unreachable: isError=True (not masked as success)", r["result"].get("isError") is True, r["result"])
+            dead.stdin.close(); dead.terminate()
 
         finally:
             proc.stdin.close(); proc.terminate()

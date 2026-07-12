@@ -148,8 +148,11 @@ def call_tool(name, args):
     if name == "attenuate":
         if "constraints" not in args:
             return 0, {"error": "attenuate requires 'constraints'"}
-        return api("POST", f"/caps/{CAP_ID}/attenuate",
-                   {"constraints": args["constraints"], "name": args.get("name"), "ttl_s": args.get("ttl_s")})
+        body = {"constraints": args["constraints"]}
+        for k in ("name", "ttl_s"):  # omit when absent — a present null defeats the broker's default
+            if args.get(k) is not None:
+                body[k] = args[k]
+        return api("POST", f"/caps/{CAP_ID}/attenuate", body)
     if name == "escalate":
         if "want" not in args:
             return 0, {"error": "escalate requires 'want'"}
@@ -175,11 +178,12 @@ def err(rpc_id, code, message, data=None):
 
 
 def tool_result(payload, status):
-    """Wrap a broker response as an MCP tools/call result. A 4xx capdel denial is reported
-    with isError=true so the model sees a failed tool call, but the violated-constraint body
-    is preserved as text so it can reason about escalating."""
+    """Wrap a broker response as an MCP tools/call result. A 4xx capdel denial — or a local/
+    transport failure (status 0: broker unreachable, misconfig, bad args) — is reported with
+    isError=true so the model sees a failed tool call, but the violated-constraint body is
+    preserved as text so it can reason about escalating."""
     return {"content": [{"type": "text", "text": json.dumps(payload, indent=1)}],
-            "isError": status >= 400}
+            "isError": status == 0 or status >= 400}
 
 
 def handle(req):
