@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# capdel-sign — sign+send a capdel PoP request (HMAC-SHA256), or derive a child secret.
+#   capdel-sign METHOD PATH [BODY]   sign and send via curl (BODY is JSON text, or empty)
+#   capdel-sign derive <child-id>    derive a child cap's secret locally (attenuation mode b)
+# Env: CAPDEL_URL (broker base, may include a relay /b/<id> prefix; the signed PATH never does),
+#      CAPDEL_TOKEN (this cap's secret key — used to sign, NEVER sent on the wire).
+import hashlib, hmac, os, secrets, subprocess, sys, time
+SCHEME = "capdel-hmac-sha256"
+tok = os.environ["CAPDEL_TOKEN"].encode()
+
+def send(method, path, body):
+    base = os.environ["CAPDEL_URL"].rstrip("/")
+    bh = hashlib.sha256(body.encode()).hexdigest()
+    nonce, ts = secrets.token_hex(16), str(int(time.time()))
+    msg = "\n".join([SCHEME, method.upper(), path, bh, nonce, ts]).encode()
+    sig = hmac.new(tok, msg, hashlib.sha256).hexdigest()
+    args = ["curl", "-s", "-X", method.upper(), base + path,
+            "-H", "Capdel-Nonce: " + nonce, "-H", "Capdel-Timestamp: " + ts,
+            "-H", "Capdel-Signature: " + sig]
+    if body:
+        args += ["-H", "Content-Type: application/json", "--data-binary", body]
+    sys.exit(subprocess.call(args))
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "derive":
+        print("ct-" + hmac.new(tok, sys.argv[2].encode(), hashlib.sha256).hexdigest()[:32])
+    else:
+        send(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "")

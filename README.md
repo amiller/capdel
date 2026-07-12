@@ -92,6 +92,28 @@ curl -H "Authorization: Bearer $CAPDEL_TOKEN" http://127.0.0.1:4571/caps/$CAP_ID
 # → self-describing: constraints + literal usage examples + how to escalate
 ```
 
+## Holder-bound tokens (anti-replay, opt-in)
+
+By default a token is **bearer** (the curl examples above). The moment a token transits
+the public pod relay (§3.7), a bearer is replayable by whoever sees it. Flip to
+holder-bound **proof-of-possession** so the token is an HMAC key that never re-crosses
+the wire:
+
+```sh
+# 1. mint a PoP cap — the printed token is now a signing key, not a password
+python3 capdel.py mint fs --root ~/work --ops list,read --ttl 30m --pop
+# 2. the cap serves a ~15-line stdlib signer at GET /capdel-sign (also inlined in self-description)
+curl http://127.0.0.1:4571/capdel-sign > capdel-sign && chmod +x capdel-sign
+export CAPDEL_URL=http://127.0.0.1:4571 CAPDEL_TOKEN=ct-…
+# 3. invoke — same shape as bearer, minus the Authorization header; each request is single-use
+./capdel-sign POST /caps/$ID/invoke '{"op":"read","path":"…"}'
+```
+
+A captured request is useless: the signature binds method + broker-local path +
+body-hash + a one-time nonce + timestamp (`±300s`). Modes: `CAPDEL_POP=off` (default,
+bearer) | `allow` (per-request) | `require` (PoP mandatory). Design:
+`tasks/pop-design-hmac.md`; tests: `python3 test/test_pop.py`.
+
 ## The five verbs
 
 | verb | who | what |
