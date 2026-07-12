@@ -9,6 +9,7 @@
 # from prod-deploy, so run this yourself:
 #   CAPDEL_OWNER_SECRET=some-long-secret [CAPDEL_POP=require] bash deploy.sh
 set -euo pipefail
+export PATH="$HOME/.deno/bin:$PATH"   # so the bundle's `deno check` resolves
 CVM="${CVM:-https://pod.dstack.soc1024.com}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TEE_DAEMON_TOKEN="${TEE_DAEMON_TOKEN:-$(grep -E '^TEE_DAEMON_TOKEN=' "$HOME/projects/hermes-agent/deploy-notes/.env.prod9" 2>/dev/null | cut -d= -f2- || true)}"
@@ -27,8 +28,14 @@ PY
 )
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-# -h dereferences the capdel.ts symlink so the real broker source ships in the tarball.
-tar czhf "$TMP/app.tgz" -C "$DIR" broker.ts capdel.ts project.json
+# The pod deno runtime runs a SINGLE entry file (it does not resolve local imports), so
+# bundle capdel.ts + the adapter into one broker.ts. capdel.ts is dependency-free, so a
+# plain concat is a valid module: drop capdel.ts's CLI auto-run and broker.ts's import.
+sed '/if (import.meta.main) await main();/d' "$DIR/capdel.ts" > "$TMP/broker.ts"
+grep -v '^import { configure, ensureHome, handle } from "./capdel.ts";' "$DIR/broker.ts" >> "$TMP/broker.ts"
+cp "$DIR/project.json" "$TMP/project.json"
+deno check "$TMP/broker.ts" >/dev/null 2>&1 || { echo "bundle failed deno check"; exit 1; }
+tar czf "$TMP/app.tgz" -C "$TMP" broker.ts project.json
 RESP=$(curl -fsS -X POST "$CVM/_api/projects" \
   -H "Authorization: Bearer $TEE_DAEMON_TOKEN" \
   -F "manifest=$MANIFEST;type=application/json" \
