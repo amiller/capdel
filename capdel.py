@@ -9,6 +9,7 @@ CAPS, REQS, AUDIT = HOME / "caps", HOME / "requests", HOME / "audit.jsonl"
 FS_OPS = {"list", "read", "write", "stat"}
 DEF_MAX_BYTES, DEF_TIMEOUT, DEF_MAX_OUTPUT = 1 << 20, 60, 1 << 18
 OWNER_SECRET = os.environ.get("CAPDEL_OWNER_SECRET")  # gates read-only /_tree, /_audit
+REQUEST_TTL = int(os.environ.get("CAPDEL_REQUEST_TTL", 3600))  # escalation requests expire after this
 
 
 class Denied(Exception): pass
@@ -22,6 +23,8 @@ def ensure_home():
 
 def now(): return int(time.time())
 def sha(t): return hashlib.sha256(t.encode()).hexdigest()
+def req_status(req):  # a pending request past its TTL is effectively expired
+    return "expired" if req["status"] == "pending" and now() > req.get("expires_at", 1 << 62) else req["status"]
 
 
 def load(kind_dir, oid):
@@ -267,8 +270,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(401, {"error": "polling a request needs the SAME token you escalated with — send 'Authorization: Bearer <that token>'"})
             if not cap or sha(self._token()) != cap["token_sha256"]:
                 return self._json(401, {"error": "that token does not match the cap that filed this request"})
-            out = {"request_id": req["id"], "status": req["status"]}
-            if req["status"] == "approved":
+            st = req_status(req)
+            out = {"request_id": req["id"], "status": st}
+            if st == "approved":
                 out.update(token=req["token"], cap=req["minted_cap"])
             return self._json(200, out)
         self._json(404, {"error": "no such route"})
@@ -300,7 +304,8 @@ class Handler(BaseHTTPRequestHandler):
             want = {**cap["constraints"], **(body.get("want") or {})}
             validate_constraints(cap["type"], want)
             req = {"id": "req-" + secrets.token_hex(6), "cap": cap["id"], "type": cap["type"],
-                   "want": want, "reason": body.get("reason", ""), "status": "pending", "created": now()}
+                   "want": want, "reason": body.get("reason", ""), "status": "pending",
+                   "created": now(), "expires_at": now() + REQUEST_TTL}
             save(REQS, req)
             audit(event="escalate", cap=cap["id"], request=req["id"], want=want, reason=req["reason"])
             return self._json(200, {"request_id": req["id"], "status": "pending",
@@ -395,15 +400,17 @@ def cmd_mint(a):
 def cmd_requests(_):
     for p in sorted(REQS.glob("*.json")):
         r = json.loads(p.read_text())
-        if r["status"] != "pending": continue
+        if req_status(r) != "pending": continue   # skip decided AND expired
         cap = load(CAPS, r["cap"])
-        print(f"{r['id']}  from {r['cap']} ({cap['name']!r})  reason: {r['reason']}\n"
+        mins = (r.get("expires_at", now()) - now()) // 60
+        print(f"{r['id']}  from {r['cap']} ({cap['name']!r})  reason: {r['reason']}  [expires in {mins}m]\n"
               f"  wants: {json.dumps(r['want'])}")
 
 
 def cmd_approve(a):
     req = load(REQS, a.request)
-    if not req or req["status"] != "pending": raise SystemExit(f"no pending request {a.request}")
+    if not req: raise SystemExit(f"no such request {a.request}")
+    if req_status(req) != "pending": raise SystemExit(f"request {a.request} is {req_status(req)}, not pending")
     # The owner is the root of authority. An escalation exists because the needed grant
     # was NOT in the requester's chain, so approving mints it as a fresh owner capability
     # (same power as `capdel mint`) — not a sibling clamped to the requester's ancestor.
