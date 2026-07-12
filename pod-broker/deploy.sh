@@ -14,7 +14,7 @@ CVM="${CVM:-https://pod.dstack.soc1024.com}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TEE_DAEMON_TOKEN="${TEE_DAEMON_TOKEN:-$(grep -E '^TEE_DAEMON_TOKEN=' "$HOME/projects/hermes-agent/deploy-notes/.env.prod9" 2>/dev/null | cut -d= -f2- || true)}"
 : "${TEE_DAEMON_TOKEN:?no daemon token (set TEE_DAEMON_TOKEN or populate .env.prod9)}"
-: "${CAPDEL_OWNER_SECRET:?set CAPDEL_OWNER_SECRET (the pod broker's owner gate)}"
+: "${CAPDEL_OWNER_SECRET:?set CAPDEL_OWNER_SECRET (the pod broker owner gate)}"
 POP="${CAPDEL_POP:-off}"
 
 MANIFEST=$(CAPDEL_OWNER_SECRET="$CAPDEL_OWNER_SECRET" POP="$POP" python3 - <<'PY'
