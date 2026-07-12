@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="capdel: two independent implementations of a capability-delegation broker, cross-validated byte-for-byte against one conformance suite.">
+<meta property="og:title" content="capdel — two implementations, one spec">
+<meta property="og:description" content="A spec is real when independent implementations agree. capdel: python 52/52, deno 52/52, crypto interop 7/7.">
+<title>capdel — two implementations, one spec</title>
+<style>
+  :root {
+    --paper: #e9edf2;
+    --ground: #e3e8ee;
+    --surface: #f7f9fc;
+    --surface-2: #eef2f7;
+    --ink: #101a2b;
+    --ink-soft: #38465a;
+    --muted: #66748a;
+    --line: #cfd7e1;
+    --line-strong: #b6c1cf;
+    --brass: #8a5f11;
+    --brass-bright: #b07d1e;
+    --verdigris: #1d7a5a;
+    --verdigris-soft: #d9ece4;
+    --iron: #a23a2f;
+    --iron-soft: #f0dcd8;
+    --shadow: 0 1px 2px rgba(16,26,43,.06), 0 8px 30px rgba(16,26,43,.06);
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0b1320;
+      --ground: #080f19;
+      --surface: #121d2c;
+      --surface-2: #16212f;
+      --ink: #e9eef4;
+      --ink-soft: #b6c3d2;
+      --muted: #7c8ba0;
+      --line: #223041;
+      --line-strong: #2d3d50;
+      --brass: #d9a23a;
+      --brass-bright: #ecba55;
+      --verdigris: #46b98f;
+      --verdigris-soft: #12312a;
+      --iron: #d5695c;
+      --iron-soft: #331a18;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 34px rgba(0,0,0,.34);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #e9edf2; --ground: #e3e8ee; --surface: #f7f9fc; --surface-2: #eef2f7;
+    --ink: #101a2b; --ink-soft: #38465a; --muted: #66748a; --line: #cfd7e1; --line-strong: #b6c1cf;
+    --brass: #8a5f11; --brass-bright: #b07d1e; --verdigris: #1d7a5a; --verdigris-soft: #d9ece4;
+    --iron: #a23a2f; --iron-soft: #f0dcd8;
+    --shadow: 0 1px 2px rgba(16,26,43,.06), 0 8px 30px rgba(16,26,43,.06);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0b1320; --ground: #080f19; --surface: #121d2c; --surface-2: #16212f;
+    --ink: #e9eef4; --ink-soft: #b6c3d2; --muted: #7c8ba0; --line: #223041; --line-strong: #2d3d50;
+    --brass: #d9a23a; --brass-bright: #ecba55; --verdigris: #46b98f; --verdigris-soft: #12312a;
+    --iron: #d5695c; --iron-soft: #331a18;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 34px rgba(0,0,0,.34);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 78% -8%, color-mix(in srgb, var(--brass) 9%, transparent), transparent 60%),
+      var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 0 24px; }
+  .col { max-width: 66ch; }
+
+  /* ---- top bar ---- */
+  .bar { display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+    padding: 22px 0 0; }
+  .wordmark { font-family: var(--mono); font-weight: 700; font-size: 15px; letter-spacing: -.01em; color: var(--ink); }
+  .wordmark b { color: var(--brass); }
+  .bar .meta { font-family: var(--mono); font-size: 11.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+
+  /* ---- hero ---- */
+  header.hero { padding: 62px 0 36px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .2em; text-transform: uppercase;
+    color: var(--brass); display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
+  .eyebrow::before { content: ""; width: 26px; height: 1px; background: var(--brass); display: inline-block; }
+  h1 { font-family: var(--mono); font-weight: 680; letter-spacing: -.035em; text-wrap: balance;
+    font-size: clamp(2.15rem, 6.2vw, 3.9rem); line-height: 1.03; margin: 0 0 24px; }
+  h1 .agree { color: var(--verdigris); position: relative; white-space: nowrap; }
+  .lead { font-size: clamp(1.06rem, 2.2vw, 1.22rem); color: var(--ink-soft); max-width: 60ch; margin: 0; }
+  .lead b { color: var(--ink); font-weight: 600; }
+
+  /* ---- verdict strip ---- */
+  .verdicts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 34px; }
+  .vchip { font-family: var(--mono); font-size: 13px; display: flex; align-items: center; gap: 9px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 8px 15px 8px 12px;
+    box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); animation: rise .5s cubic-bezier(.2,.7,.3,1) forwards; }
+  .vchip .n { color: var(--verdigris); font-weight: 700; }
+  .vchip .lbl { color: var(--ink-soft); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--verdigris);
+    box-shadow: 0 0 0 4px var(--verdigris-soft); }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+
+  /* ---- sections ---- */
+  section { padding: 40px 0; border-top: 1px solid var(--line); }
+  .kicker { font-family: var(--mono); font-size: 12px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 14px; }
+  h2 { font-family: var(--mono); font-weight: 650; letter-spacing: -.02em; font-size: clamp(1.35rem, 3vw, 1.8rem);
+    line-height: 1.15; margin: 0 0 16px; text-wrap: balance; }
+  p { margin: 0 0 16px; }
+  p.col, .col p { color: var(--ink-soft); }
+  .col p strong, strong { color: var(--ink); font-weight: 600; }
+  a { color: var(--brass); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--brass) 40%, transparent); }
+  a:hover { border-bottom-color: var(--brass); }
+  a:focus-visible { outline: 2px solid var(--brass); outline-offset: 3px; border-radius: 2px; }
+
+  /* ---- code panel ---- */
+  figure.code { margin: 26px 0 8px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+  figure.code .head { display: flex; align-items: center; gap: 8px; padding: 11px 16px;
+    border-bottom: 1px solid var(--line); background: var(--surface-2); }
+  figure.code .head .tag { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06em; color: var(--muted); }
+  figure.code .head .tag b { color: var(--ink-soft); }
+  pre { margin: 0; padding: 16px 18px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px;
+    line-height: 1.7; color: var(--ink); }
+  pre .sc { color: var(--brass); font-weight: 600; }
+  pre .c { color: var(--muted); }
+  pre .k { color: var(--verdigris); }
+  figcaption { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 12px; }
+
+  /* ---- ledger ---- */
+  .ledger { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; box-shadow: var(--shadow);
+    background: var(--surface); margin-top: 8px; }
+  .lrow { display: grid; grid-template-columns: 1fr 96px 96px; align-items: center;
+    border-top: 1px solid var(--line); }
+  .lrow:first-child { border-top: none; }
+  .lhead { background: var(--surface-2); }
+  .lhead > div { font-family: var(--mono); font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); padding: 12px 16px; }
+  .lhead > .impl { text-align: center; color: var(--ink-soft); }
+  .lname { font-size: 14px; color: var(--ink-soft); padding: 13px 16px; }
+  .lname b { color: var(--ink); font-weight: 600; font-family: var(--mono); font-size: 12.5px;
+    background: var(--surface-2); padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); margin-right: 2px; }
+  .cell { display: flex; justify-content: center; padding: 10px 8px; }
+  .pass { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--verdigris);
+    background: var(--verdigris-soft); border-radius: 6px; padding: 4px 10px; display: inline-flex; align-items: center; gap: 6px;
+    opacity: 0; animation: rise .45s ease forwards; }
+  .pass::before { content: "✓"; }
+  .lrow.total { background: var(--surface-2); }
+  .lrow.total .lname { color: var(--ink); font-weight: 600; }
+  .lrow.total .num { font-family: var(--mono); font-weight: 700; text-align: center; color: var(--verdigris);
+    padding: 13px 16px; font-variant-numeric: tabular-nums; }
+
+  /* ---- interop steps ---- */
+  ol.steps { list-style: none; counter-reset: s; margin: 22px 0 0; padding: 0; display: grid; gap: 2px; }
+  ol.steps li { counter-increment: s; position: relative; display: grid; grid-template-columns: 34px 1fr;
+    gap: 16px; align-items: start; padding: 16px 0; border-top: 1px dashed var(--line); }
+  ol.steps li:first-child { border-top: none; }
+  ol.steps li::before { content: counter(s, decimal-leading-zero); font-family: var(--mono); font-size: 12px;
+    font-weight: 700; color: var(--brass); background: var(--surface); border: 1px solid var(--line-strong);
+    border-radius: 8px; width: 34px; height: 34px; display: grid; place-items: center; box-shadow: var(--shadow); }
+  ol.steps .st { font-size: 14.5px; color: var(--ink-soft); }
+  ol.steps .st b { color: var(--ink); font-weight: 600; }
+  .who { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 1px 6px;
+    border-radius: 5px; border: 1px solid var(--line); }
+  .who.py { color: var(--brass); background: color-mix(in srgb, var(--brass) 12%, transparent); }
+  .who.ts { color: var(--verdigris); background: var(--verdigris-soft); }
+
+  /* ---- cleave ---- */
+  .cleave { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 22px; }
+  .cleave > div { border: 1px solid var(--line); border-radius: 12px; padding: 20px; background: var(--surface); box-shadow: var(--shadow); }
+  .cleave h3 { font-family: var(--mono); font-size: 14px; margin: 0 0 4px; letter-spacing: -.01em; }
+  .cleave .authority h3 { color: var(--verdigris); }
+  .cleave .enforce h3 { color: var(--brass); }
+  .cleave .tag2 { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 12px; }
+  .cleave p { font-size: 13.5px; color: var(--ink-soft); margin: 0; }
+
+  /* ---- footer ---- */
+  footer { border-top: 1px solid var(--line); padding: 34px 0 60px; margin-top: 24px; }
+  .fnote { font-size: 13px; color: var(--muted); max-width: 60ch; }
+  .flinks { display: flex; flex-wrap: wrap; gap: 20px; margin: 16px 0 0; font-family: var(--mono); font-size: 13px; }
+  .stamp { font-family: var(--mono); font-size: 11.5px; color: var(--muted); letter-spacing: .04em; margin-top: 22px;
+    display: flex; align-items: center; gap: 8px; }
+  .stamp .dot { width: 6px; height: 6px; box-shadow: 0 0 0 3px var(--verdigris-soft); }
+
+  @media (max-width: 640px) {
+    .cleave { grid-template-columns: 1fr; }
+    .lrow { grid-template-columns: 1fr 72px 72px; }
+    h1 .agree { white-space: normal; }
+    .bar .meta { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .vchip, .pass { animation: none; opacity: 1; transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="bar">
+    <div class="wordmark"><b>capdel</b> · capability delegation broker</div>
+    <div class="meta">conformance report · 2026-07-12</div>
+  </div>
+
+  <header class="hero">
+    <div class="eyebrow">verify a spec by building it twice</div>
+    <h1>Two implementations.<br>One spec. They <span class="agree">agree</span>, byte&#8209;for&#8209;byte.</h1>
+    <p class="lead"><b>capdel</b> hands an AI agent a narrow, revocable slice of authority — read <em>this</em> directory, run <em>that</em> command, reach <em>one</em> host — instead of a whole credential. A broker is only as trustworthy as its spec is unambiguous. So the spec was built twice, in two languages, and cross&#8209;validated against a shared suite.</p>
+
+    <div class="verdicts">
+      <div class="vchip" style="animation-delay:.05s"><span class="dot"></span><span class="n">52/52</span><span class="lbl">python broker</span></div>
+      <div class="vchip" style="animation-delay:.15s"><span class="dot"></span><span class="n">52/52</span><span class="lbl">deno broker</span></div>
+      <div class="vchip" style="animation-delay:.25s"><span class="dot"></span><span class="n">7/7</span><span class="lbl">crypto interop</span></div>
+      <div class="vchip" style="animation-delay:.35s"><span class="dot"></span><span class="n">20/20</span><span class="lbl">proof-of-possession</span></div>
+    </div>
+  </header>
+
+  <section>
+    <p class="kicker">The wager</p>
+    <div class="col">
+      <h2>A protocol is real when independent implementations agree.</h2>
+      <p>One implementation can be self-consistent and still wrong — it silently defines the parts the spec left vague. A <strong>second, independent implementation</strong> has no access to the first one's private assumptions. Where the two diverge is exactly where the specification was thin. Where they agree without negotiation, the spec is load-bearing.</p>
+      <p>So capdel now ships as two brokers — a stdlib-only <strong>Python</strong> reference and a dependency-free <strong>Deno / TypeScript</strong> port — plus a language-neutral conformance suite that drives both over the same wire protocol and asserts identical verdicts. Same vectors in, same allow / deny out.</p>
+    </div>
+  </section>
+
+  <section>
+    <p class="kicker">What has to agree</p>
+    <div class="col">
+      <h2>The sharp edge is the cryptography.</h2>
+      <p>Allow/deny logic is forgiving — two readings of a rule usually still reject the same attack. Cryptography is not: the two brokers must build the <strong>exact same bytes</strong> before hashing, or a token signed by one is garbage to the other. This canonicalization ambiguity is the classic under-specification bug — the entire pain history of JWT / JOSE. Pinning it is the whole point of a second implementation.</p>
+    </div>
+    <figure class="code">
+      <div class="head"><span class="tag"><b>proof-of-possession</b> · the signed canonical string</span></div>
+<pre><span class="sc">capdel-hmac-sha256</span>   <span class="c">&larr; scheme</span>
+POST                 <span class="c">&larr; method</span>
+/caps/cap-9f…/invoke <span class="c">&larr; request path</span>
+7d865e959b2466…     <span class="c">&larr; sha256(body)</span>
+b3c1…                <span class="c">&larr; nonce</span>
+1768226400           <span class="c">&larr; unix timestamp</span>
+<span class="c">──────────────────────────────</span>
+sig = <span class="k">HMAC-SHA256</span>(token, join("\n", …))</pre>
+      <figcaption>&#8202;Newline-joined, in this order. Both brokers compute it identically — tamper the body, path, method, nonce, or timestamp and the signature fails; replay a nonce and the second use is rejected.</figcaption>
+    </figure>
+    <figure class="code">
+      <div class="head"><span class="tag"><b>offline attenuation</b> · deriving a child capability's key</span></div>
+<pre>child_secret = <span class="sc">"ct-"</span> + <span class="k">HMAC-SHA256</span>(parent_token, child_id)[:32]</pre>
+      <figcaption>&#8202;A parent narrows a capability without a round trip — the child's key is <em>derived</em>, never transmitted. Python and Deno produce the same 32 hex characters, in both directions.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <p class="kicker">The ledger · 8 scenarios, 52 checks</p>
+    <h2>Every row, both columns.</h2>
+    <div class="ledger" id="ledger">
+      <div class="lrow lhead"><div>scenario</div><div class="impl">python</div><div class="impl">deno</div></div>
+      <div class="lrow"><div class="lname"><b>fs</b> list · read · write · path-escape denied</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>fs</b> attenuation — narrow ok, widen denied</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>exec</b> argv-prefix match · cwd containment</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>net</b> destination allow/deny · attenuation</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>pop</b> tamper · replay · stale — all rejected</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>escalate</b> deny → request → approve → new cap</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>closure</b> owner event revokes the subtree</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow"><div class="lname"><b>require</b> mode — bearer rejected, PoP accepted</div><div class="cell"><span class="pass">PASS</span></div><div class="cell"><span class="pass">PASS</span></div></div>
+      <div class="lrow total"><div class="lname">total</div><div class="num">52/52</div><div class="num">52/52</div></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kicker">The interop proof</p>
+    <div class="col">
+      <h2>One broker mints it, the other verifies it — on shared state.</h2>
+      <p>The strongest check isn't running two brokers in parallel; it's making them <strong>hand a live token to each other</strong>. A proof-of-possession capability minted by Python, sitting as a file on disk, is verified and attenuated by Deno — then the capability Deno derived is verified back by Python.</p>
+    </div>
+    <ol class="steps">
+      <li><span class="who py">python</span><div class="st">mints a PoP capability <b>p</b> &mdash; its token is an HMAC key, written to a file on disk.</div></li>
+      <li><span class="who ts">deno</span><div class="st">reads the same state dir and <b>verifies</b> a token-signed request against <b>p</b> &mdash; canonical string and on-disk format agree.</div></li>
+      <li><span class="who ts">deno</span><div class="st"><b>attenuates</b> <b>p</b> into a narrower child capability and returns its derived key.</div></li>
+      <li><span class="who py">python</span><div class="st">independently recomputes that child key from the formula &mdash; <b>identical, byte-for-byte</b>.</div></li>
+      <li><span class="who py">python</span><div class="st"><b>verifies</b> the child capability Deno just minted. Full round trip, both directions.</div></li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="kicker">The line it draws</p>
+    <div class="col">
+      <h2>Authority is specified. Enforcement is a platform concern.</h2>
+      <p>The suite makes an architectural boundary explicit. What two implementations can agree on — and what belongs in the wire spec — is <strong>authority semantics</strong>. What can't be cross-validated, because it's platform-specific by nature, is <strong>enforcement</strong>. Keeping them apart is the design, not a shortcut.</p>
+    </div>
+    <div class="cleave">
+      <div class="authority">
+        <span class="tag2">in the spec · conformance-tested</span>
+        <h3>Authority</h3>
+        <p>Minting, attenuation subset rules, invocation allow/deny, proof-of-possession, escalation, revocation, trusted closure. Portable across languages — and now proven so.</p>
+      </div>
+      <div class="enforce">
+        <span class="tag2">platform annex · out of scope here</span>
+        <h3>Enforcement</h3>
+        <p>Deno permissions, kernel Landlock / seccomp, sandboxing. What actually stops an unconfined agent from ignoring the broker. Specific to where it runs — a separate, honest problem.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p class="fnote">capdel is an early prototype. This report covers the <strong>authority layer</strong>: the two brokers agree on it completely. The enforcement layer above is deliberately not claimed here. The conformance suite lives in the repo and is the regression gate for every future change to the spec.</p>
+    <div class="flinks">
+      <a href="https://github.com/amiller/capdel">github.com/amiller/capdel</a>
+      <a href="https://github.com/amiller/capdel/tree/main/conformance">/conformance</a>
+      <span style="color:var(--muted);border:none">MIT</span>
+    </div>
+    <div class="stamp"><span class="dot"></span> python 52/52 · deno 52/52 · interop 7/7 · pop 20/20 — all green</div>
+  </footer>
+</div>
+
+<script>
+  // Stagger the PASS chips down the ledger so agreement reads as it fills in.
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!reduce) {
+    document.querySelectorAll("#ledger .pass").forEach((el, i) => {
+      el.style.animationDelay = (0.15 + i * 0.05) + "s";
+    });
+  }
+</script>
+
+</body>
+</html>
