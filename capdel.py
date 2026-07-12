@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """capdel — broker for dynamic capability delegation to agents. See SPEC.md."""
-import argparse, base64, hashlib, hmac, json, os, re, secrets, socket, subprocess, sys, threading, time
+import argparse, base64, hashlib, hmac, json, os, re, secrets, socket, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HOME = Path(os.environ.get("CAPDEL_HOME", str(Path.home() / ".capdel")))
-CAPS, REQS, AUDIT = HOME / "caps", HOME / "requests", HOME / "audit.jsonl"
+CAPS, REQS, AUDIT, SECRETS = HOME / "caps", HOME / "requests", HOME / "audit.jsonl", HOME / "secrets"
+# `secret`-type caps vault the credential here (issue #19). The value is NEVER a field on the
+# cap JSON (cap["secret"] is the unrelated PoP HMAC key); only `secret_ref` points at a file
+# under SECRETS, read solely inside secret_invoke. Encrypted-at-rest, stdlib-only.
 FS_OPS = {"list", "read", "write", "stat"}
 DEF_MAX_BYTES, DEF_TIMEOUT, DEF_MAX_OUTPUT = 1 << 20, 60, 1 << 18
 OWNER_SECRET = os.environ.get("CAPDEL_OWNER_SECRET")  # gates read-only /_tree, /_audit
@@ -69,9 +72,57 @@ class Denied(Exception): pass
 
 
 def ensure_home():
-    for d in (CAPS, REQS):
+    for d in (CAPS, REQS, SECRETS):
         d.mkdir(parents=True, exist_ok=True)
     HOME.chmod(0o700)
+
+
+# --- `secret` cap vault (issue #19) -----------------------------------------------------------
+# At-rest protection for pasted credentials. No symmetric cipher ships in the Python stdlib,
+# so this is an HMAC-SHA256 counter-mode keystream XOR'd against the plaintext, with an
+# HMAC tag for tamper detection. Prototype-grade by design (the issue's own caveat: without
+# kernel confinement #8 a holder with FS access can read the vault anyway — this layer is
+# belt-and-suspenders against offline disk reads / accidental commits, not a strong bound).
+# Upgrade path: AES-GCM via `cryptography`, or a kernel keyring. Fast to decrypt (a few HMACs).
+
+def _keystream(key, salt, n):
+    out, i = b"", 0
+    while len(out) < n:
+        out += hmac.new(key, salt + i.to_bytes(8, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def _master_key():
+    p = SECRETS / "master.key"
+    if not p.exists():
+        SECRETS.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(secrets.token_bytes(32))
+        p.chmod(0o600)
+    return p.read_bytes()
+
+
+def vault_store(capid, value):
+    SECRETS.mkdir(parents=True, exist_ok=True)
+    mk, salt = _master_key(), secrets.token_bytes(16)
+    pt = value.encode()
+    ct = bytes(a ^ b for a, b in zip(pt, _keystream(mk, salt, len(pt))))
+    tag = hmac.new(mk, salt + ct, hashlib.sha256).digest()
+    f = SECRETS / f"{capid}.bin"
+    f.write_bytes(salt + tag + ct)
+    f.chmod(0o600)
+
+
+def vault_load(capid):
+    f = SECRETS / f"{capid}.bin"
+    if not f.exists():
+        raise Denied(f"no vaulted secret for {capid} (secret_ref points nowhere)")
+    blob = f.read_bytes()
+    salt, tag, ct = blob[:16], blob[16:48], blob[48:]
+    mk = _master_key()
+    if not hmac.compare_digest(hmac.new(mk, salt + ct, hashlib.sha256).digest(), tag):
+        raise Denied(f"vaulted secret for {capid} is corrupt or tampered (HMAC mismatch)")
+    return bytes(a ^ b for a, b in zip(ct, _keystream(mk, salt, len(ct)))).decode()
 
 
 def now(): return int(time.time())
@@ -212,6 +263,19 @@ def validate_constraints(type_, c):
             raise Denied("llm 'models' must be a non-empty list of model-name strings")
         if "max_tokens" in c and not (isinstance(c["max_tokens"], int) and c["max_tokens"] > 0):
             raise Denied("llm 'max_tokens' must be a positive int")
+    elif type_ == "secret":
+        dests = c.get("destinations")
+        if not dests or not all(isinstance(d, list) and len(d) == 2 and isinstance(d[0], str)
+                                and isinstance(d[1], int) and d[1] >= 0 for d in dests):
+            raise Denied("secret 'destinations' must be a non-empty list of [host, port] (port int, 0=any)")
+        if not isinstance(c.get("inject"), str) or "{{secret}}" not in c["inject"]:
+            raise Denied("secret 'inject' must be a template string containing the literal {{secret}}")
+        if "tls" in c and not isinstance(c["tls"], bool):
+            raise Denied("secret 'tls' must be a boolean")
+        if "max_bytes" in c and not (isinstance(c["max_bytes"], int) and c["max_bytes"] > 0):
+            raise Denied("secret 'max_bytes' must be a positive int")
+        if "timeout_s" in c and not (isinstance(c["timeout_s"], int) and c["timeout_s"] > 0):
+            raise Denied("secret 'timeout_s' must be a positive int")
     else:
         raise Denied(f"unknown capability type {type_!r}")
 
@@ -245,13 +309,30 @@ def check_subset(type_, child, parent_cap):
             raise Denied("max_bytes exceeds parent's")
         if child.get("timeout_s", DEF_TIMEOUT) > p.get("timeout_s", DEF_TIMEOUT):
             raise Denied("timeout_s exceeds parent's")
-    else:  # llm
+    elif type_ == "llm":
         extra = set(child["models"]) - set(p["models"])
         if extra: raise Denied(f"models {sorted(extra)} exceed parent models {p['models']}")
         if child.get("max_tokens", 1 << 30) > p.get("max_tokens", 1 << 30):
             raise Denied("max_tokens exceeds parent's")
         if child.get("base_url", p.get("base_url")) != p.get("base_url"):
             raise Denied("base_url may not differ from parent's")
+    else:  # secret (validate_constraints already rejected anything unknown before we get here)
+        _check_secret_subset(child, p)
+
+
+def _check_secret_subset(child, p):
+    # secret: narrow WHERE (destinations subset), never HOW (inject byte-equal) or whether TLS.
+    for ch, cp in child["destinations"]:
+        if not any(ph == ch and (pp == 0 or pp == cp) for ph, pp in p["destinations"]):
+            raise Denied(f"destination [{ch}, {cp}] not covered by parent destinations {p['destinations']}")
+    if child.get("inject") != p.get("inject"):
+        raise Denied("inject template may not differ from parent's (you may narrow WHERE the key is used, not HOW)")
+    if child.get("tls", True) != p.get("tls", True):
+        raise Denied("tls setting may not differ from parent's")
+    if child.get("max_bytes", DEF_MAX_BYTES) > p.get("max_bytes", DEF_MAX_BYTES):
+        raise Denied("max_bytes exceeds parent's")
+    if child.get("timeout_s", DEF_TIMEOUT) > p.get("timeout_s", DEF_TIMEOUT):
+        raise Denied("timeout_s exceeds parent's")
 
 
 def validate_closes_on(events):
@@ -293,6 +374,11 @@ def mint(type_, constraints, name, ttl_s, parent=None, pop=False, closes_on=None
            "pop": bool(pop), "closes_on": closes_on}
     if secret is not None:
         cap["secret"] = secret                            # bearer caps store only the hash
+    if type_ == "secret":
+        # The vaulted credential lives OUT of the cap JSON (in SECRETS/<id>.bin); `secret_ref`
+        # names the root cap whose vault holds it. A child inherits its parent's secret_ref
+        # (same key, narrower use). Note: cap["secret"] above is the unrelated PoP HMAC key.
+        cap["secret_ref"] = (parent["secret_ref"] if (parent and parent.get("secret_ref")) else cid)
     save(CAPS, cap)
     audit(event="mint", cap=cap["id"], parent=cap["parent"], name=name, constraints=constraints,
           pop=bool(pop), closes_on=closes_on)
@@ -396,6 +482,47 @@ def llm_invoke(cap, body):
         raise Denied(f"llm upstream {e.code}: {e.read()[:200].decode(errors='replace')}")
 
 
+def secret_invoke(cap, body):
+    # The credential cap (issue #19). The broker holds the key in an encrypted vault and INJECTS
+    # it into the outbound bytes AFTER the relay boundary; the holder sends only {op:"connect",
+    # host, port, send?} and never sees the key. Same one-shot dial+relay+close shape as net.
+    c = cap["constraints"]
+    if body.get("op") != "connect":
+        raise Denied(f"op {body.get('op')!r} not supported; the only secret op is 'connect' "
+                     f"(the broker injects the vaulted key — there is deliberately no op that returns it)")
+    host, port = body["host"], int(body["port"])
+    if not any(ph == host and (pp == 0 or pp == port) for ph, pp in c["destinations"]):
+        raise Denied(f"[{host}, {port}] not in allowed destinations {c['destinations']}")
+    value = vault_load(cap["secret_ref"])                 # the ONE place the value is decrypted
+    prefix = c["inject"].replace("{{secret}}", value).encode()   # …never returned, logged, or stored
+    max_bytes = c.get("max_bytes", DEF_MAX_BYTES)
+    timeout_s = c.get("timeout_s", DEF_TIMEOUT)
+    send = base64.b64decode(body["send"]) if body.get("send") else b""   # optional request body (NOT the key)
+    chunks, total = [], 0
+    raw = socket.create_connection((host, port), timeout=timeout_s)
+    sock = raw
+    try:
+        raw.settimeout(timeout_s)
+        if c.get("tls", True):
+            ctx = ssl.create_default_context()            # system CA store; hostname verified
+            sock = ctx.wrap_socket(raw, server_hostname=host)
+        sock.sendall(prefix)
+        if send:
+            sock.sendall(send)
+        while total < max_bytes:
+            b = sock.recv(min(65536, max_bytes - total))
+            if not b:
+                break
+            chunks.append(b); total += len(b)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return {"recv": base64.b64encode(b"".join(chunks)).decode(), "bytes": total,
+            "truncated": total >= max_bytes}
+
+
 def describe(cap, base):
     c, cpath = cap["constraints"], f"/caps/{cap['id']}"
     if cap.get("pop"):  # PoP cap: `how` bootstraps the capdel-sign helper (no Bearer on the wire)
@@ -409,6 +536,10 @@ def describe(cap, base):
         elif cap["type"] == "llm":
             ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"chat\",\"model\":\"{(c.get('models') or ['MODEL'])[0]}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'",
                   'op: {"op":"chat","model":…,"messages":[…],"max_tokens"?:…} (broker injects the shared key)']
+        elif cap["type"] == "secret":
+            d = c["destinations"][0] if c.get("destinations") else ["HOST", 0]
+            ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"connect\",\"host\":\"{d[0]}\",\"port\":{d[1]}}}'",
+                  'op: {"op":"connect","host":…,"port":…,"send"?:<base64>} (broker injects the vaulted key; you never see it)']
         else:
             dest = c["allow"][0] if c.get("allow") else ["HOST", 0]
             ex = [f"./capdel-sign POST {cpath}/invoke '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}'",
@@ -424,7 +555,12 @@ def describe(cap, base):
                "constraints": cap["constraints"], "expires_at": cap["expires_at"],
                "auth": "pop-hmac-sha256", "how": how, "sign_helper": SIGN_HELPER}
     else:  # bearer cap: the original curl one-liner
-        dest = c["allow"][0] if (cap["type"] == "net" and c.get("allow")) else ["HOST", 0]
+        if cap["type"] == "net":
+            dest = c["allow"][0] if c.get("allow") else ["HOST", 0]
+        elif cap["type"] == "secret":
+            dest = c["destinations"][0] if c.get("destinations") else ["HOST", 0]
+        else:
+            dest = ["HOST", 0]
         how = {
             "fs": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"list\",\"path\":\"{c.get('root','')}\"}}' {base}/caps/{cap['id']}/invoke",
                    f"you may: {', '.join(c.get('ops', []))}. shapes: "
@@ -435,6 +571,12 @@ def describe(cap, base):
                     'op: {"op":"connect","host":…,"port":…,"send"?:<base64>} → {recv:<base64>,bytes,truncated}; send a request with Connection: close so the peer closes'],
             "llm": [f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"chat\",\"model\":\"{(c.get('models') or ['MODEL'])[0]}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}' {base}/caps/{cap['id']}/invoke",
                     f"you may call models {c.get('models', [])} (the broker injects the shared key; you never see it). op: {{\"op\":\"chat\",\"model\":…,\"messages\":[…],\"max_tokens\"?:…}} → OpenAI-shaped completion"],
+            "secret": [
+                f"curl -s -H 'Authorization: Bearer $CAPDEL_TOKEN' -d '{{\"op\":\"connect\",\"host\":\"{dest[0]}\",\"port\":{dest[1]}}}' {base}/caps/{cap['id']}/invoke",
+                "the broker injects the vaulted credential per the template below; you NEVER see the value. "
+                'op: {"op":"connect","host":…,"port":…,"send"?:<base64 body>} → {"recv":<base64>,"bytes":N,"truncated":bool}. '
+                "inject template (value redacted as {{secret}}): " + c.get("inject", ""),
+            ],
         }[cap["type"]]
         out = {"id": cap["id"], "name": cap["name"], "type": cap["type"],
                "constraints": cap["constraints"], "expires_at": cap["expires_at"],
@@ -469,7 +611,8 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n)) if n else {}
 
     def _token(self):
-        return (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+        s = self.headers.get("Authorization") or ""
+        return (s[len("Bearer "):].strip() if s.startswith("Bearer ") else s.strip())
 
     def _authn(self, cid, method, body_bytes):
         """Resolve the cap at `cid` and authenticate by PoP mode + per-cap `pop` flag.
@@ -560,6 +703,9 @@ class Handler(BaseHTTPRequestHandler):
             # driven over HTTP, e.g. from a pod where there is no shell to run `capdel mint`).
             if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
             b = self._body()
+            if b["type"] == "secret":
+                return self._json(400, {"error": "secret caps are created via `capdel vault` "
+                                     "(reads the value from stdin so it never hits argv/audit), not /_mint"})
             try:
                 cap, token = mint(b["type"], b["constraints"], b.get("name", "root grant"),
                                   int(b.get("ttl_s", 14400)), pop=bool(b.get("pop")), closes_on=b.get("closes_on"))
@@ -585,11 +731,17 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else {}
             check_live(cap)
             if action == "invoke":
-                result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke, "llm": llm_invoke}[cap["type"]](cap, body)
+                result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke,
+                          "llm": llm_invoke, "secret": secret_invoke}[cap["type"]](cap, body)
                 cap["last_used"] = now()
                 save(CAPS, cap)
-                audit(event="invoke", cap=cap["id"], op=body.get("op"),
-                      arg=body.get("path") or body.get("argv") or body.get("host"), decision="allow")
+                a = {"event": "invoke", "cap": cap["id"], "op": body.get("op"),
+                     "arg": body.get("path") or body.get("argv") or body.get("host"), "decision": "allow"}
+                if body.get("op") == "connect":   # net/secret: record destination + reply size (issue #19 audit)
+                    a["dest"] = f"{body.get('host')}:{body.get('port')}"
+                    if isinstance(result, dict) and "bytes" in result:
+                        a["bytes"] = result["bytes"]
+                audit(**a)
                 return self._json(200, result)
             if action == "attenuate":
                 child_pop = bool(cap.get("pop")) or ("secret" in cap)   # a PoP parent begets PoP children
@@ -643,6 +795,9 @@ def fmt_constraints(cap):
     if cap["type"] == "llm":
         mt = f" ≤{c['max_tokens']}tok" if c.get("max_tokens") else ""
         return f"llm [{','.join(c['models'])}]{mt}"
+    if cap["type"] == "secret":
+        dests = ', '.join(f"{h}:{p if p else '*'}" for h, p in c["destinations"])
+        return f"secret [{dests}] tls={'on' if c.get('tls', True) else 'off'}"
     dests = ', '.join(f"{h}:{p if p else '*'}" for h, p in c["allow"])
     return f"net [{dests}]"
 
@@ -723,6 +878,33 @@ def cmd_mint(a):
     print(f"id={cap['id']}\ntoken={token}\nexpires_at={cap['expires_at']}")
 
 
+def decode_escapes(s):
+    # Let --inject be written readably from a shell: \r \n \t \\ are decoded to real bytes.
+    # ASCII HTTP templates only — anything non-ASCII passes through untouched.
+    try:
+        return s.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return s
+
+
+def cmd_vault(a):
+    # Ingest a credential (issue #19): read the value from stdin so it never enters argv,
+    # shell history, ps, or the audit log. Vault it encrypted-at-rest and mint a `secret` cap
+    # that references it by id. Default pop=True (a leaked token ≠ a spent key); --no-pop opts out.
+    constraints = {"destinations": [parse_dest(d) for d in a.allow],
+                   "inject": decode_escapes(a.inject), "tls": not a.no_tls}
+    if a.max_bytes: constraints["max_bytes"] = a.max_bytes
+    if a.timeout: constraints["timeout_s"] = a.timeout
+    value = sys.stdin.read().rstrip("\r\n")
+    if not value:
+        raise SystemExit("no secret read on stdin — pipe it: printf 'sk-...' | capdel vault --name … --allow … --inject …")
+    cap, token = mint("secret", constraints, a.name, parse_ttl(a.ttl), pop=not a.no_pop)
+    vault_store(cap["secret_ref"], value)   # secret_ref == cap['id'] for a root (set in mint)
+    print(f"id={cap['id']}\ntoken={token}\nexpires_at={cap['expires_at']}\n"
+          f"type=secret name={cap['name']} pop={cap['pop']}\n"
+          f"note: the value is vaulted under secrets/{cap['secret_ref']}.bin and is never returned by any op")
+
+
 def cmd_requests(_):
     for p in sorted(REQS.glob("*.json")):
         r = json.loads(p.read_text())
@@ -744,6 +926,13 @@ def cmd_approve(a):
     # Record provenance on the minted cap so the dashboard can render the grant's
     # lineage (which request, from which cap, why) as data instead of parsing the name.
     cap["escalation"] = {"request": req["id"], "source_cap": req["cap"], "reason": req["reason"]}
+    if req["type"] == "secret":
+        # The value can't be re-derived; an approved secret escalation widens destinations but
+        # keeps the SAME vaulted key — point the fresh cap at the source cap's vault.
+        src = load(CAPS, req["cap"])
+        if not src or not src.get("secret_ref"):
+            raise SystemExit(f"source cap {req['cap']} has no vaulted secret to widen")
+        cap["secret_ref"] = src["secret_ref"]
     save(CAPS, cap)
     req.update(status="approved", token=token, minted_cap=cap["id"], decided=now())
     save(REQS, req)
@@ -865,6 +1054,19 @@ def main():
     s.add_argument("--closes-on", dest="closes_on", action="append", default=[],
                    help="trusted event name that auto-revokes this cap when the owner fires `capdel event NAME` (repeatable)")
     s.set_defaults(f=cmd_mint)
+    s = sub.add_parser("vault",
+                       help="paste-vault a credential (stdin) as a `secret` cap; the broker injects it on connect (issue #19)")
+    s.add_argument("--name", required=True, help="human label for the vaulted credential (e.g. openai)")
+    s.add_argument("--allow", action="append", required=True,
+                   help="destination host:port the key may be used toward (repeatable); port * or 0 = any")
+    s.add_argument("--inject", required=True,
+                   help="request template the broker writes after connect; must contain the literal {{secret}}; \\r\\n\\t escapes decoded")
+    s.add_argument("--no-tls", action="store_true", help="dial raw TCP instead of TLS (default TLS, system CA, SNI=host)")
+    s.add_argument("--no-pop", action="store_true", help="mint as a bearer cap (default: PoP — a leaked token ≠ a spent key)")
+    s.add_argument("--ttl", default="4h")
+    s.add_argument("--max-bytes", type=int, dest="max_bytes", help="cap on relayed reply bytes per connect")
+    s.add_argument("--timeout", type=int, help="connect/relay timeout in seconds")
+    s.set_defaults(f=cmd_vault)
     s = sub.add_parser("tree"); s.set_defaults(f=cmd_tree)
     s = sub.add_parser("requests"); s.set_defaults(f=cmd_requests)
     s = sub.add_parser("approve"); s.add_argument("request"); s.add_argument("--ttl", default="1h")
