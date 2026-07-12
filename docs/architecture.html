@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>capdel · oauth3 · dstack-webhost — how they fit together</title>
+<meta name="description" content="One idea, three layers: capability delegation. dstack-webhost delegates attested compute; oauth3 delegates your web accounts; capdel delegates local and agent resources. How they compose.">
+<style>
+  :root{
+    --bg:#eef1f4; --surface:#ffffff; --raise:#f4f6f9;
+    --ink:#14181d; --muted:#59636e; --faint:#8a94a0;
+    --line:#d7dde4; --line-soft:#e5e9ee;
+    --brass:#a9741f; --brass-2:#c68a26; --brass-ink:#7a5313;
+    --dim:#aeb7c1;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --shadow:0 1px 2px rgba(20,24,29,.05), 0 12px 34px -18px rgba(20,24,29,.28);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0d1116;--surface:#141a21;--raise:#19212a;--ink:#e7ecf1;--muted:#93a0ad;--faint:#68757f;
+      --line:#242d37;--line-soft:#1c242d;--brass:#e2ab3c;--brass-2:#f0c15c;--brass-ink:#f0c15c;--dim:#3a4653;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 18px 44px -20px rgba(0,0,0,.7);}
+  }
+  :root[data-theme="light"]{--bg:#eef1f4;--surface:#ffffff;--raise:#f4f6f9;--ink:#14181d;--muted:#59636e;--faint:#8a94a0;
+    --line:#d7dde4;--line-soft:#e5e9ee;--brass:#a9741f;--brass-2:#c68a26;--brass-ink:#7a5313;--dim:#aeb7c1;
+    --shadow:0 1px 2px rgba(20,24,29,.05), 0 12px 34px -18px rgba(20,24,29,.28);}
+  :root[data-theme="dark"]{--bg:#0d1116;--surface:#141a21;--raise:#19212a;--ink:#e7ecf1;--muted:#93a0ad;--faint:#68757f;
+    --line:#242d37;--line-soft:#1c242d;--brass:#e2ab3c;--brass-2:#f0c15c;--brass-ink:#f0c15c;--dim:#3a4653;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 18px 44px -20px rgba(0,0,0,.7);}
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:17px;line-height:1.6;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden}
+  .wrap{max-width:940px;margin:0 auto;padding:0 24px}
+  a{color:inherit}
+  ::selection{background:var(--brass);color:#0c1014}
+
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;color:var(--brass);font-weight:600}
+  h1,h2,h3{font-family:var(--mono);font-weight:640;letter-spacing:-.02em;text-wrap:balance;margin:0}
+  h1{font-size:clamp(1.9rem,4.4vw,3rem);line-height:1.05}
+  h2{font-size:clamp(1.35rem,2.6vw,1.8rem);line-height:1.1}
+  h3{font-size:1.02rem}
+  p{margin:0}
+  .lede{font-size:clamp(1.04rem,1.6vw,1.2rem);color:var(--muted);max-width:64ch;line-height:1.56}
+  code{font-family:var(--mono);font-size:.86em;color:var(--brass-ink);background:color-mix(in srgb,var(--brass) 12%,transparent);padding:1px 5px;border-radius:5px}
+
+  header.bar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 86%,transparent);
+    backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line-soft)}
+  .bar .wrap{display:flex;align-items:center;gap:16px;height:58px;max-width:940px}
+  .mark{font-family:var(--mono);font-weight:680;letter-spacing:-.03em;font-size:1.12rem;display:flex;align-items:center;gap:.55rem;text-decoration:none}
+  .mark .dot{width:9px;height:9px;border-radius:50%;background:var(--brass);box-shadow:0 0 0 4px color-mix(in srgb,var(--brass) 22%,transparent)}
+  .bar nav{margin-left:auto;display:flex;gap:6px}
+  .bar nav a,.tbtn{font-family:var(--mono);font-size:.82rem;color:var(--muted);text-decoration:none;padding:7px 11px;border-radius:8px;border:1px solid transparent;cursor:pointer;background:none}
+  .bar nav a:hover,.tbtn:hover{color:var(--ink);border-color:var(--line)}
+  .tbtn{line-height:0}.tbtn svg{width:16px;height:16px;display:block;fill:currentColor}
+
+  .head{padding:clamp(44px,7vw,80px) 0 10px}
+  .head .kick{display:inline-flex;align-items:center;gap:.6rem;margin-bottom:20px}
+  .head .kick .rule{height:1px;width:34px;background:var(--brass);opacity:.7}
+  .head h1{max-width:20ch}.head h1 em{font-style:normal;color:var(--brass)}
+  .head .lede{margin-top:20px}
+
+  figure{margin:clamp(34px,5vw,54px) 0 8px}
+  .diagram{background:var(--raise);border:1px solid var(--line);border-radius:16px;padding:clamp(14px,2.5vw,26px);box-shadow:var(--shadow)}
+  .diagram svg{width:100%;height:auto;display:block}
+  svg text{font-family:var(--sans)}
+  svg .mt{font-family:var(--mono)}
+  figcaption{font-family:var(--mono);font-size:.8rem;color:var(--faint);margin-top:14px;text-align:center;letter-spacing:.01em}
+
+  section{padding:clamp(40px,6vw,68px) 0;border-top:1px solid var(--line-soft)}
+  .shead{margin-bottom:30px;max-width:60ch}
+  .shead .eyebrow{display:block;margin-bottom:12px}
+  .shead p{color:var(--muted);margin-top:12px}
+
+  .layers{display:flex;flex-direction:column;gap:14px}
+  .layer{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:22px 24px;
+    display:grid;grid-template-columns:200px 1fr;gap:8px 28px;align-items:start;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .layer::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--brass)}
+  .layer .name{font-family:var(--mono);font-weight:680;font-size:1.08rem}
+  .layer .name small{display:block;font-weight:500;font-size:.74rem;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-top:6px}
+  .layer .body p{color:var(--muted);font-size:.98rem}
+  .layer .body .meta{font-family:var(--mono);font-size:.78rem;color:var(--muted);margin-top:12px;display:flex;flex-wrap:wrap;gap:6px 18px}
+  .layer .body .meta b{color:var(--brass);font-weight:600}
+
+  .compose{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:24px 26px;box-shadow:var(--shadow)}
+  .compose ol{margin:16px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:12px;counter-reset:s}
+  .compose li{display:grid;grid-template-columns:26px 1fr;gap:14px;align-items:baseline;color:var(--muted);font-size:.99rem}
+  .compose li::before{counter-increment:s;content:counter(s);font-family:var(--mono);font-weight:680;color:var(--brass);
+    border:1px solid var(--line);border-radius:7px;width:26px;height:26px;display:grid;place-items:center;font-size:.82rem}
+  .compose li b{color:var(--ink);font-weight:600}
+  .compose li code{white-space:nowrap}
+
+  footer{border-top:1px solid var(--line-soft);padding:36px 0 60px;color:var(--muted);font-size:.9rem}
+  footer .row{display:flex;flex-wrap:wrap;gap:14px 24px;align-items:center;justify-content:space-between}
+  footer a{color:var(--brass);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--brass) 40%,transparent)}
+
+  a:focus-visible,button:focus-visible{outline:2px solid var(--brass);outline-offset:3px;border-radius:6px}
+  @media (max-width:640px){
+    .layer{grid-template-columns:1fr;gap:12px}
+    .layer .name small{margin-top:4px}
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="mark" href="./"><span class="dot"></span>capdel</a>
+    <nav>
+      <a href="./">home</a>
+      <a href="https://github.com/amiller/capdel">GitHub</a>
+      <button class="tbtn" id="theme" title="Toggle theme" aria-label="Toggle light / dark theme">
+        <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.03-.9-.1-1.34A6 6 0 0 1 12 3z"></path></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <div class="head">
+      <span class="kick"><span class="rule"></span><span class="eyebrow">architecture</span></span>
+      <h1>One idea, three layers: <em>capability delegation.</em></h1>
+      <p class="lede">capdel, oauth3, and dstack-webhost are the same move applied at different depths — hand out a narrow, revocable <em style="font-style:normal;color:var(--ink)">slice</em> of authority instead of the raw thing, and keep enforcement on your side. Each delegates something different: attested compute, your web accounts, and your local resources.</p>
+    </div>
+
+    <figure>
+      <div class="diagram">
+        <svg viewBox="0 0 840 588" role="img" aria-label="Diagram: dstack-webhost hosts oauth3 and teleport-pod; teleport-pod borrows an account from oauth3 via a jar and a shared key from the capdel broker on your machine.">
+          <defs>
+            <marker id="arw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--brass)"></path>
+            </marker>
+          </defs>
+
+          <!-- you / visitor -->
+          <rect x="60" y="26" width="220" height="52" rx="12" fill="var(--surface)" stroke="var(--line)"></rect>
+          <text x="170" y="49" text-anchor="middle" font-size="15" font-weight="600" fill="var(--ink)">you — or your agent</text>
+          <text x="170" y="67" text-anchor="middle" font-size="11.5" class="mt" fill="var(--muted)">a person, or a trusted Claude Code session</text>
+
+          <!-- dstack-webhost host container -->
+          <rect x="30" y="120" width="780" height="248" rx="16" fill="var(--raise)" stroke="var(--line)"></rect>
+          <text x="52" y="147" font-size="12" class="mt" letter-spacing="1.5" fill="var(--brass)">DSTACK-WEBHOST</text>
+          <text x="196" y="147" font-size="12" class="mt" fill="var(--faint)">— attested TEE host · runs pod apps, source-bound &amp; measurable</text>
+
+          <!-- oauth3 app -->
+          <rect x="58" y="176" width="216" height="150" rx="12" fill="var(--surface)" stroke="var(--line)"></rect>
+          <text x="76" y="208" font-size="17" font-weight="680" class="mt" fill="var(--ink)">oauth3</text>
+          <text x="76" y="230" font-size="12.5" fill="var(--muted)">your web accounts</text>
+          <text x="76" y="258" font-size="11" class="mt" fill="var(--faint)">sealed cookie jars</text>
+          <text x="76" y="276" font-size="11" class="mt" fill="var(--faint)">scoped, revocable tokens</text>
+          <text x="76" y="294" font-size="11" class="mt" fill="var(--faint)">consent + admission gate</text>
+
+          <!-- teleport-pod app (highlighted) -->
+          <rect x="312" y="176" width="216" height="150" rx="12" fill="var(--surface)" stroke="var(--brass)" stroke-width="1.7"></rect>
+          <text x="330" y="208" font-size="17" font-weight="680" class="mt" fill="var(--brass-ink)">teleport-pod</text>
+          <text x="330" y="230" font-size="12.5" fill="var(--muted)">the app (an example)</text>
+          <text x="330" y="258" font-size="11" class="mt" fill="var(--faint)">post-once tweet vouchers</text>
+          <text x="330" y="276" font-size="11" class="mt" fill="var(--faint)">holds no raw secret —</text>
+          <text x="330" y="294" font-size="11" class="mt" fill="var(--faint)">only borrowed capabilities</text>
+
+          <!-- other apps (dim) -->
+          <rect x="566" y="176" width="216" height="150" rx="12" fill="var(--surface)" stroke="var(--line)" stroke-dasharray="4 4"></rect>
+          <text x="584" y="208" font-size="15" font-weight="640" class="mt" fill="var(--dim)">cart-share</text>
+          <text x="584" y="230" font-size="12.5" fill="var(--dim)">otterpilot · …</text>
+          <text x="584" y="262" font-size="11" class="mt" fill="var(--dim)">other pod apps, same</text>
+          <text x="584" y="280" font-size="11" class="mt" fill="var(--dim)">connect-to-oauth3 pattern</text>
+
+          <!-- your machine container -->
+          <rect x="312" y="452" width="470" height="112" rx="14" fill="var(--raise)" stroke="var(--line)"></rect>
+          <text x="332" y="479" font-size="12" class="mt" letter-spacing="1.2" fill="var(--faint)">YOUR MACHINE (or a relay pod)</text>
+          <rect x="332" y="490" width="430" height="58" rx="10" fill="var(--surface)" stroke="var(--brass)" stroke-width="1.2"></rect>
+          <text x="350" y="514" font-size="15" font-weight="680" class="mt" fill="var(--ink)">capdel broker</text>
+          <text x="350" y="534" font-size="11.5" class="mt" fill="var(--muted)">fs · exec · net · llm — a reference monitor that holds the key / authority</text>
+
+          <!-- arrow: you -> oauth3 -->
+          <path d="M166 78 L166 174" fill="none" stroke="var(--brass)" stroke-width="1.6" marker-end="url(#arw)"></path>
+          <text x="176" y="132" font-size="11.5" class="mt" fill="var(--muted)">connect → approve</text>
+
+          <!-- arrow: teleport-pod -> oauth3 (jar) -->
+          <path d="M310 250 L278 250" fill="none" stroke="var(--brass)" stroke-width="1.6" marker-end="url(#arw)"></path>
+          <text x="293" y="240" font-size="11" class="mt" fill="var(--muted)" text-anchor="middle">jar</text>
+
+          <!-- arrow: teleport-pod -> capdel (llm) -->
+          <path d="M420 328 L420 486" fill="none" stroke="var(--brass)" stroke-width="1.6" marker-end="url(#arw)"></path>
+          <text x="432" y="404" font-size="11.5" class="mt" fill="var(--muted)">llm · revocable cap token</text>
+          <text x="432" y="421" font-size="10.5" class="mt" fill="var(--faint)">broker injects the key</text>
+        </svg>
+      </div>
+      <figcaption>teleport-pod runs on the host, borrows an account from oauth3, and borrows a shared key from capdel — three delegations, no raw secret in the app.</figcaption>
+    </figure>
+  </div>
+
+  <section>
+    <div class="wrap">
+      <div class="shead">
+        <span class="eyebrow">the three, by what they delegate</span>
+        <h2>Same primitive, three domains.</h2>
+      </div>
+      <div class="layers">
+        <div class="layer">
+          <div class="name">dstack-webhost<small>the ground</small></div>
+          <div class="body">
+            <p>The attested TEE app host — <code>tee-daemon</code> running inside a dstack (Phala) confidential VM. You hand it a tarball + manifest and it runs your code <b style="color:var(--ink);font-weight:600">source-bound and measurable</b>, gives it a URL, injects config via <code>ctx.env</code>, and hands out persistent storage via <code>ctx.dataDir</code>.</p>
+            <div class="meta"><span>delegates <b>attested compute</b></span><span>enforces <b>measurement · isolation</b></span></div>
+          </div>
+        </div>
+        <div class="layer">
+          <div class="name">oauth3<small>account layer</small></div>
+          <div class="body">
+            <p>An app <b style="color:var(--ink);font-weight:600">running on</b> dstack-webhost. It holds sealed cookie jars keyed by <code>subject:plugin</code>, mints scoped revocable tokens, and runs the connect → approve consent flow. Its lane: <em style="font-style:normal;color:var(--ink)">"let this app act as me on a site I have a session to, without my password."</em></p>
+            <div class="meta"><span>delegates <b>your web accounts</b></span><span>enforces <b>who gets which jar-scope</b></span></div>
+          </div>
+        </div>
+        <div class="layer">
+          <div class="name">capdel<small>resource layer</small></div>
+          <div class="body">
+            <p>A local reference monitor. It delegates <code>fs · exec · net · llm</code> between agents of different trust — minted at dispatch time, attenuated, escalatable, revocable to the leaf. Runs on your machine; a dstack pod can act as a dial-out relay so a remote agent reaches it without the authority ever leaving home.</p>
+            <div class="meta"><span>delegates <b>local / agent resources</b></span><span>enforces <b>what a holder may do</b></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="shead">
+        <span class="eyebrow">they compose</span>
+        <h2>teleport-pod uses all three at once.</h2>
+        <p>The post-once voucher app is the whole stack in one place — it never holds a raw secret, only borrowed capabilities.</p>
+      </div>
+      <div class="compose">
+        <ol>
+          <li><span><b>Runs on dstack-webhost.</b> Deployed as a pod app; reads its config from <code>ctx.env</code>, persists vouchers in <code>ctx.dataDir</code>, served at <code>/teleport-pod</code> — attested like any project.</span></li>
+          <li><span><b>Borrows an account through oauth3.</b> A visitor clicks connect → approves on the oauth3 screen → the pod gets a <code>jar-cap</code> token and posts as them, <b>without their X password ever touching the app.</b></span></li>
+          <li><span><b>Borrows a key through capdel.</b> Its content filter calls the shared model via a capdel <code>llm</code> capability — the broker injects the key, the pod holds only a <b>revocable cap token</b>. Kill it and the app is cut off instantly.</span></li>
+        </ol>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="row">
+      <a class="mark" href="./"><span class="dot"></span>capdel</a>
+      <span style="font-family:var(--mono);font-size:.82rem;color:var(--faint)">
+        <a href="./">capdel</a> · <a href="https://github.com/amiller/capdel/blob/main/SPEC.md">spec</a>
+      </span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function(){
+    var root=document.documentElement,k="capdel-theme",s=null;
+    try{s=localStorage.getItem(k)}catch(e){}
+    if(s)root.setAttribute("data-theme",s);
+    document.getElementById("theme").addEventListener("click",function(){
+      var c=root.getAttribute("data-theme");
+      if(!c)c=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";
+      var n=c==="dark"?"light":"dark";root.setAttribute("data-theme",n);
+      try{localStorage.setItem(k,n)}catch(e){}
+    });
+  })();
+</script>
+</body>
+</html>
