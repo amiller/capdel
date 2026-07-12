@@ -16,6 +16,11 @@ Single file, stdlib-only Python 3.9+. State in `$CAPDEL_HOME` (default `~/.capde
 - **`capdel.py`** — the whole thing: the broker (a local reference monitor that holds
   real fs/exec/net authority) plus the CLI (`serve`, `mint`, `tree`, `approve`, `revoke`,
   `tunnel`).
+- **`mcp_server.py`** — a thin MCP server (Model Context Protocol, stdio, stdlib-only)
+  that exposes a capability as native MCP tools (`describe`/`invoke`/`attenuate`/
+  `escalate`/`poll_request`) for harnesses that only speak MCP. It holds only
+  `CAPDEL_URL`+`CAPDEL_TOKEN`+`CAP_ID` and forwards to the broker; the broker still
+  enforces everything. See *MCP harnesses* below.
 - **`skill/capdel/SKILL.md`** — a Claude Code skill that teaches a trusted agent to reach
   for capdel when it dispatches a subagent (mint a narrow capability, hand over only a
   token). Drop it in `~/.claude/skills/capdel/` to use it. **Start here to understand the
@@ -156,6 +161,34 @@ the API is its only route to the resource. It can bootstrap entirely from
 `GET /caps/<id>`. Confinement of the agent *process* is a separate, composable
 layer (run it in Docker+gVisor/Deno with only those two env vars) — the broker
 bounds what the token can do, the sandbox bounds what the process can do.
+
+## MCP harnesses (harnesses that only speak MCP)
+
+Some agent harnesses only speak the Model Context Protocol — their tool list is fixed at
+session start, so they can't `curl` a capdel URL or discover a capability mid-flight. For
+those, `mcp_server.py` is a ~thin adapter: spawn it as an MCP server with the same two
+values a subagent already gets, and the capability shows up as native tools
+(`describe`, `invoke`, `attenuate`, `escalate`, `poll_request`). It parses nothing and
+enforces nothing — every call is forwarded to the broker over the HTTP API in §5, so the
+broker is still the only reference monitor.
+
+```sh
+python3 capdel.py serve &                      # broker on 127.0.0.1:4571
+python3 capdel.py mint fs --root ~/work --ops list,read --ttl 30m --name helper   # → id + token
+```
+
+then point your MCP harness at (e.g. a Claude Desktop / MCP-client config):
+
+```json
+{"command": "python3", "args": ["mcp_server.py"],
+ "env": {"CAPDEL_URL": "http://127.0.0.1:4571",
+          "CAPDEL_TOKEN": "ct-…", "CAP_ID": "cap-…"}}
+```
+
+A denial comes back as a tool *error* that names the violated constraint, so the model
+can decide to `escalate` and `poll_request` for the result. Auth is bearer by default; a
+PoP (`--pop`) cap wants PoP signing, which belongs in `capdel-sign`, not this wrapper.
+Black-box drive: `python3 test/mcp.py`.
 
 ## Remote agents + the dashboard (`pod/`)
 

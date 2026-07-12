@@ -352,7 +352,8 @@ State: `$CAPDEL_HOME` (default `~/.capdel`), 0700: `caps/*.json`, `requests/*.js
 - **MCP** — orthogonal: MCP describes tools to a model at session start; capdel is
   the authority behind a tool and is discoverable mid-flight (§3.5). A thin MCP
   server wrapping `invoke` is an obvious v0.2 so harnesses that only speak MCP can
-  join.
+  join — **shipped as `mcp_server.py`** (wraps `describe`/`invoke`/`attenuate`/
+  `escalate`/`poll_request`; see README §“MCP harnesses”).
 
 ### 7.1 AAuth findings (researched 2026-07-11)
 
