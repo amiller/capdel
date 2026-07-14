@@ -147,7 +147,51 @@ non-answer to "just give it SOCKS5 back": a raw proxy is ambient L4 authority ov
 the whole home vantage; a `net` capability is a per-destination, per-connection,
 revocable grant shaped exactly like `fs` paths and `exec` argv.
 
-The three types are deliberately *deny-by-default and prefix-shaped*: the subset
+**`llm`** — scoped use of a broker-held LLM API key (OpenAI-compatible chat/completions).
+The broker holds `CAPDEL_LLM_KEY` in its environment and injects it into the outbound
+request; the holder sends only `{op:"chat", model, messages}` and never sees the key.
+Attenuation narrows the allowed `models` and `max_tokens`; `base_url` may not differ from
+the parent's. This is the narrow, single-protocol sibling of `secret` (below): one canned
+HTTP shape, one key from the broker env. It exists so a fleet of agents can share one
+billing key without any of them ever holding the string.
+
+**`secret`** — a vaulted credential the broker injects into outbound bytes (the
+terminal-agent analog of oauth3's browser cookie-vault; capdel as a powerbox for CLI
+secrets). `fs | exec | net | llm` all scope access to things the broker's machine *has*;
+`secret` covers the one thing SPEC §1 names first — a credential the remote agent "holds
+the whole of, not the narrow slice." You paste it once, capdel vaults it (encrypted at
+rest, keyed by a master key under `$CAPDEL_HOME/secrets/`), and it is *used* broker-side
+so the plaintext never enters any holder's context.
+
+```json
+{ "destinations": [["api.openai.com", 443], ["10.0.0.5", 0]],   // (host, port) prefixes, like net; 0 = any port
+  "inject": "GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\n"
+            "Authorization: Bearer {{secret}}\r\nConnection: close\r\n\r\n",   // MUST contain the {{secret}} sentinel
+  "tls": true,                        // wrap the dial in TLS (default; system CA, SNI = host)
+  "max_bytes": 1048576, "timeout_s": 30 }
+```
+
+Enforcement reuses the `net` dial+relay shape, but with **broker-side injection**. The
+holder calls `{op:"connect", host, port, send?}`; the broker validates the destination,
+dials (TLS if `tls`), writes `inject` with `{{secret}}` replaced by the vaulted value
+*after* the relay boundary, then relays the peer's reply and closes. The key string never
+crosses to the agent: the holder only ever sees a connect whose bytes are already flowing.
+There is **no invoke op that returns the raw secret** — `describe`/`read` of a `secret` cap
+reveal `name` + `destinations` + the `inject` template (with the value redacted as
+`{{secret}}`) + usage count, never the value. Ingest is `capdel vault --name …` (reads the
+value from **stdin** — never argv, never shell history, never the audit log); secret caps
+are created only by `vault`, never by `mint`/`_mint`. Every use is audited with destination
++ byte count so `capdel audit`/`tree` answer "how was my key used" without trusting the
+agent's narration.
+
+**Trustworthy only with confinement (§3.8/#8).** Unconfined, a holder with filesystem
+access on the broker machine can read the vault file directly instead of asking the
+broker — the property is real only once caps are kernel-backed. The at-rest encryption is
+belt-and-suspenders against offline disk reads, not a strong bound against the holder
+process. `secret` caps therefore default to PoP (`--pop`) so a leaked token ≠ a spent key
+once one could transit the public relay (§3.7).
+
+The five types are deliberately *deny-by-default and prefix-shaped*: the subset
 relation needed for attenuation (3.2) is decidable by inspection.
 
 ### 3.2 Attenuation rules
@@ -163,6 +207,13 @@ calls, no LLM in the loop at enforcement time.
 - net: every `child.allow` entry `(h, p)` must be covered by some parent entry
   `(h, p')` where `h` is identical and `p' == 0` (parent allows any port) or
   `p' == p`; `child.max_bytes ≤ parent.max_bytes`, `child.timeout_s ≤`.
+- llm: `child.models ⊆ parent.models`; `child.max_tokens ≤ parent.max_tokens`;
+  `child.base_url` must equal `parent.base_url`.
+- secret: every `child.destinations` entry `(h, p)` must be covered by some parent entry
+  (same net rule); `child.inject` must be byte-equal to `parent.inject` (you may narrow
+  WHERE the key is used, never HOW); `child.tls == parent.tls`;
+  `child.max_bytes ≤`, `child.timeout_s ≤`. A child inherits the parent's `secret_ref`
+  (same vaulted key) — attenuation never re-pastes the value.
 - all: `child.expires_at ≤ parent.expires_at`; same `type`.
 
 Anyone holding a token can attenuate it further (delegation is not owner-only —
@@ -289,6 +340,17 @@ capabilities).
   it attenuates. Root minting is offline-only.
 - **The broker is TCB.** ~600 lines of stdlib Python, no deps, no shell, realpath
   containment, prefix-matched argv. Small enough to read.
+- **`secret` caps vault the credential at rest** under `$CAPDEL_HOME/secrets/<id>.bin`
+  (HMAC-SHA256 counter-mode keystream XOR + HMAC tag, keyed by `secrets/master.key`; a
+  prototype-grade cipher chosen because the stdlib ships no AES — the upgrade path is
+  AES-GCM via `cryptography` or a kernel keyring). **This is trustworthy only under
+  confinement (§3.8/#8):** unconfined, a holder with FS access on the broker machine reads
+  the vault directly instead of asking the broker — the real property (the holder process
+  never receives the key) holds only once caps are kernel-backed. `secret` caps default to
+  PoP so a leaked token ≠ a spent key. Note the HTTP-level gap: the broker owns the auth
+  header in the injected prefix, but a holder's `send` bytes are appended on the same
+  socket, so a holder could emit a competing header — bounded by `destinations` (it can
+  only talk to the allowed host) and by the upstream's own header handling.
 - **Known v0 gaps**: bearer tokens are the default but **HMAC-PoP is implemented** (`--pop` /
   `CAPDEL_POP=require`) — the remaining gap is the *symmetric* cost: a PoP cap's secret is
   stored at rest in `~/.capdel` (the broker must hold it to verify), so reading the state
@@ -316,7 +378,12 @@ fs invoke ops: `{"op":"list","path"}`, `{"op":"read","path"}`, `{"op":"write","p
 `{code, stdout, stderr, truncated}`. net invoke:
 `{"op":"connect","host":…,"port":…,"send"?:<base64>}` → `{recv:<base64>, bytes, truncated}`
 — one brokered TCP connection to an allowed `(host, port)`, optional bytes sent, reply
-relayed back up to `max_bytes`, then closed.
+relayed back up to `max_bytes`, then closed. llm invoke: `{"op":"chat","model":…,"messages":[…],"max_tokens"?}`
+→ OpenAI-shaped completion (broker injects `CAPDEL_LLM_KEY`; holder never sees it). secret
+invoke: `{"op":"connect","host":…,"port":…,"send"?:<base64 body>}` → `{recv:<base64>, bytes, truncated}`
+— same one-shot dial+relay+close as net, but the broker first writes `inject` with `{{secret}}`
+substituted from the vault (TLS if `tls`); the holder's request never contains the key, and
+no op returns the raw value.
 
 Errors are always `{"error": …, "violated": …?}` with 4xx — no silent clamping;
 a denied call names the constraint it hit so the agent can decide to escalate.
@@ -329,14 +396,19 @@ capdel tunnel --relay https://pod…/capdel-relay --broker-id NAME   # dial out 
 capdel mint fs   --root PATH --ops list,read [--ttl 4h] [--name …]     → prints id + token
 capdel mint exec --allow "git status" --allow "ls" --cwd-root PATH …   → prints id + token
 capdel mint net  --allow "api.github.com:443" --allow "10.0.0.5:*" …   → prints id + token
+capdel mint llm --models gpt-4o,glm-4.6 [--base-url …] [--max-tokens …]      → prints id + token (broker injects CAPDEL_LLM_KEY)
   # any mint may add [--closes-on EVENT …]: trusted events that auto-revoke the cap
+capdel vault --name openai --allow api.openai.com:443 \
+             --inject 'GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer {{secret}}\r\nConnection: close\r\n\r\n' \
+             [--no-tls] [--no-pop] [--ttl 4h] [--max-bytes N] [--timeout S]   # reads the value from STDIN; vaults it; prints id + token (issue #19)
 capdel event NAME           # fire a trusted event; closes every cap whose --closes-on lists it
 capdel tree | capdel audit [--cap ID] | capdel requests
 capdel approve REQ [--ttl 1h] | capdel deny REQ | capdel revoke CAP
 ```
 
 State: `$CAPDEL_HOME` (default `~/.capdel`), 0700: `caps/*.json`, `requests/*.json`,
-`audit.jsonl`. CLI talks to the same state dir directly (no HTTP needed for owner ops).
+`audit.jsonl`, and `secrets/*.bin` + `secrets/master.key` (0600) for `secret`-type caps.
+CLI talks to the same state dir directly (no HTTP needed for owner ops).
 
 ## 7. Related work
 
