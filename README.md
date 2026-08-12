@@ -154,6 +154,44 @@ to its subtree, and the effective closure is the union up the chain (shown in th
 cap self-description and `capdel tree`). Events are owner-filed only — the value is
 a signal a delegated holder *cannot* forge.
 
+## `secret` caps — paste-vault a credential, the broker injects it (issue #19)
+
+`fs | exec | net | llm` all scope access to things the broker's machine *has*. `secret`
+covers the one thing the SPEC names first — a credential the remote agent otherwise
+"holds the whole of, not the narrow slice." You paste a key once, capdel vaults it
+(encrypted at rest), and it is *used* broker-side so the plaintext never enters any
+holder's context. capdel as a powerbox for CLI secrets.
+
+```sh
+python3 capdel.py serve &
+U=http://127.0.0.1:4571
+
+# 1. Paste the key ONCE (stdin — never argv, never shell history, never audit).
+#    The inject template carries the literal {{secret}} sentinel; \r\n escapes decode.
+printf 'sk-live-key-...' | python3 capdel.py vault --name openai \
+  --allow api.openai.com:443 \
+  --inject 'GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer {{secret}}\r\nConnection: close\r\n\r\n'
+#   id=cap-…  token=ct-…  type=secret name=openai pop=True
+#   note: the value is vaulted under secrets/<id>.bin and is never returned by any op
+
+# 2. A holder (holding only the token) narrows it to exactly one host and exercises it.
+#    The broker dials api.openai.com:443, writes the inject prefix WITH the key
+#    substituted AFTER the relay boundary, relays the reply, closes. The holder
+#    never sees the key — describe, audit, and the reply are all redacted of it.
+curl -s -H "Authorization: Bearer $TOKEN" -d '{"op":"connect","host":"api.openai.com","port":443}' \
+  $U/caps/$ID/invoke
+#   → {"recv":"HTTP/1.1 200 …","bytes":N,"truncated":false}
+
+# 3. Widening the host is denied; no op returns the raw value; every use is audited:
+capdel audit --cap $ID      # each connect row: cap, ts, dest=api.openai.com:443, bytes=N — never the value
+```
+
+Trustworthy only under confinement (the SPEC §4 caveat): unconfined, a holder with
+FS access on the broker machine can read the vault directly. `secret` caps default to
+PoP (`--pop`) so a leaked token ≠ a spent key. The sibling `llm` cap is the narrow,
+single-protocol version of the same idea — one canned chat/completions shape with a
+key from the broker env; `secret` is the general, arbitrary-destination mechanism.
+
 ## Trying it on a subagent
 
 Give the subagent nothing but the URL, cap id, and token, and the instruction that
