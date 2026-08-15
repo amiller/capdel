@@ -27,7 +27,7 @@ def main():
     home, hook_log = tmp / "state", tmp / "hook.json"
     root = tmp / "work"; root.mkdir(parents=True)
     hook = tmp / "hook.sh"
-    hook.write_text(f"#!/bin/sh\ncat > {hook_log}\n")
+    hook.write_text(f"#!/bin/sh\ncat > {hook_log}\nif grep -q '\"reason\": \"fail hook\"' {hook_log}; then exit 3; fi\n")
     hook.chmod(0o700)
     env = {**os.environ, "CAPDEL_HOME": str(home), "CAPDEL_OWNER_SECRET": OWNER,
            "CAPDEL_ESCALATE_HOOK": str(hook)}
@@ -66,7 +66,15 @@ def main():
         assert status == 200 and poll["status"] == "approved" and "token" in poll
         status, desc = http("GET", f"/caps/{poll['cap']}", poll["token"])
         assert status == 200 and desc["constraints"]["ops"] == ["list", "read", "write"]
-        print("approval routing: hook, owner gate, no-token approve, poll pickup, and filed-shape clamp passed")
+        status, failed = http("POST", f"/caps/{cid}/escalate", token,
+            {"want": {"ops": ["list", "read", "write"]}, "reason": "fail hook"})
+        assert status == 200
+        for _ in range(50):
+            events = [json.loads(line) for line in (home / "audit.jsonl").read_text().splitlines()]
+            if any(e.get("event") == "hook" and e.get("decision") == "fail" for e in events): break
+            time.sleep(.1)
+        assert any(e.get("event") == "hook" and e.get("decision") == "fail" for e in events)
+        print("approval routing: hook, hook failure isolation, owner gate, no-token approve, poll pickup, and filed-shape clamp passed")
     finally:
         broker.terminate(); broker.wait(timeout=5)
         subprocess.run(["rm", "-rf", str(tmp)], check=False)
