@@ -8,7 +8,7 @@
 // secret, server-side — the browser never sees it).
 //
 // Env (ctx.env): CAPDEL_RELAY_SECRET (gates the laptop's _pull/_reply and the dashboard),
-//                CAPDEL_OWNER_SECRET (lets the dashboard read the broker's /_tree, /_audit).
+//                CAPDEL_OWNER_SECRET (lets the dashboard read/rule the broker's owner endpoints).
 
 type Job = { req_id: string; method: string; path: string; headers: Record<string, string>; body: string | null };
 type Reply = { status: number; body: string };
@@ -133,17 +133,36 @@ export default async function handler(req: Request, ctx: { env: Record<string, s
           : `clear expired failed — broker returned ${g.status}`;
       } catch { flash = `clear expired failed — broker returned ${g.status}`; }
     }
+    if (url.searchParams.get("action") && bid && OWNER_SECRET) {
+      const action = url.searchParams.get("action");
+      const rid = url.searchParams.get("request");
+      if ((action === "approve" || action === "deny") && rid) {
+        const body = action === "approve"
+          ? JSON.stringify({ ttl_s: Number(url.searchParams.get("ttl_s") || 3600) }) : null;
+        const ar = await relayCall(bid, "POST", `/_requests/${encodeURIComponent(rid)}/${action}`,
+          { Authorization: `Bearer ${OWNER_SECRET}`, "Content-Type": "application/json" }, body, 8000);
+        try {
+          const j = JSON.parse(ar.body);
+          flash = ar.status === 200 ? (action === "approve" ? `Approved ${rid} as ${j.cap_id}.` : `Denied ${rid}.`)
+            : `request action failed — broker returned ${ar.status}: ${j.error || "unknown error"}`;
+        } catch { flash = `request action failed — broker returned ${ar.status}`; }
+      }
+    }
     let tree: unknown = null, treeErr: string | null = null;
+    let requests: any[] = [];
     if (bid && OWNER_SECRET) {
       const r = await relayCall(bid, "GET", "/_tree", { Authorization: `Bearer ${OWNER_SECRET}` }, null, 8000);
       if (r.status === 200) tree = JSON.parse(r.body).tree;
       else treeErr = `broker returned ${r.status}: ${r.body}`;
+      const rr = await relayCall(bid, "GET", "/_requests", { Authorization: `Bearer ${OWNER_SECRET}` }, null, 8000);
+      if (rr.status === 200) { try { requests = JSON.parse(rr.body).requests || []; } catch {} }
     } else if (bid && !OWNER_SECRET) {
       treeErr = "CAPDEL_OWNER_SECRET not set on the relay — cannot read the grant tree";
     }
     const seen = bid && lastSeen.has(bid)
       ? Math.max(0, Math.round((Date.now() - (lastSeen.get(bid) || 0)) / 1000)) : null;
-    return html(renderDashboard(brokers, bid, tree, treeErr, recent, url.searchParams.get("key"), flash, seen));
+    return html(renderDashboard(brokers, bid, tree, treeErr, recent, requests,
+      url.searchParams.get("key"), flash, seen));
   }
 
   return json({ error: "capdel-relay: no such route" }, 404);
@@ -192,7 +211,7 @@ function renderNode(n: any, depth = 0): string {
 }
 
 function renderDashboard(brokers: string[], bid: string | undefined, tree: any, treeErr: string | null,
-                         recent: any[], key: string | null, flash: string | null, seenSec: number | null): string {
+                         recent: any[], requests: any[], key: string | null, flash: string | null, seenSec: number | null): string {
   const all: any[] = tree && Array.isArray(tree) ? tree : [];
   const flat: any[] = [];
   walk(all, (n) => flat.push(n));
@@ -254,6 +273,20 @@ function renderDashboard(brokers: string[], bid: string | undefined, tree: any, 
     : '<tr><td colspan="4" class="dim">no calls relayed yet</td></tr>';
 
   const flashHtml = flash ? `<div class="flash">${esc(flash)}</div>` : "";
+  const requestHtml = requests.length ? requests.map((r) => {
+    const c = r.cap || {};
+    const audit = (c.audit || []).slice(-10).reverse().map((e: any) =>
+      `<li><code>${esc(e.event || e.op || "event")}</code> · ${esc(JSON.stringify(e.arg || e.violated || e.decision || "") )}</li>`).join("") || "<li>no recent audit events</li>";
+    const lineage = (c.lineage || []).map((id: string) => `<code>${esc(id)}</code>`).join(" → ");
+    const q = (x: string) => encodeURIComponent(x);
+    return `<article class="request card"><div class="request-head"><strong>${esc(r.id)}</strong><span>${esc(c.name || "unknown cap")}</span></div>
+      <h3>Granted if approved</h3><pre>${esc(JSON.stringify(r.granted_if_approved, null, 2))}</pre>
+      <p><b>Requesting cap</b>: ${esc(c.name || "unknown")} · ${lineage} · expires ${new Date((c.expires_at || 0) * 1000).toISOString()}</p>
+      <p><b>Recent audit tail</b></p><ul>${audit}</ul>
+      <p class="reason"><b>Requester's words</b>: ${esc(r.reason)}</p>
+      <div class="actions"><a class="approve" href="/?action=approve&amp;request=${q(r.id)}&amp;ttl_s=${Math.max(1, Math.floor((r.expires_at - Date.now()/1000)))}${key ? `&amp;key=${q(key)}` : ""}">Approve</a>
+      <a class="deny" href="/?action=deny&amp;request=${q(r.id)}${key ? `&amp;key=${q(key)}` : ""}">Deny</a></div></article>`;
+  }).join("") : '<p class="dim">no pending approval requests</p>';
   const clearForm = (bid && brokers.length)
     ? `<form method="post" action="/?clear=1${key ? "&amp;key=" + encodeURIComponent(key) : ""}" class="clr-form">
          <button class="clr" type="submit">Clear expired</button></form>`
@@ -356,6 +389,7 @@ function renderDashboard(brokers: string[], bid: string | undefined, tree: any, 
   .clr{font:inherit;font-size:12px;font-weight:600;color:var(--teal-deep);background:var(--inset);
     border:1px solid var(--line);border-radius:7px;padding:5px 12px;cursor:pointer}
   .clr:hover{background:#dff}
+  .request.card{margin:10px 0;padding:16px}.request-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.request h3{font-size:12px;text-transform:uppercase;color:var(--teal-deep);margin:14px 0 5px}.request pre{margin:0;padding:10px;background:var(--inset);border:1px solid var(--line);overflow:auto;font-size:12px}.request ul{margin:5px 0;padding-left:20px;font-size:12px}.request .reason{color:var(--dim)}.actions{display:flex;gap:8px;margin-top:12px}.actions a{border-radius:7px;padding:5px 12px;text-decoration:none;font-weight:600}.approve{background:var(--good-bg);color:var(--good)}.deny{background:var(--crit-bg);color:var(--crit)}
 
   .logwrap{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
   .scroll{overflow-x:auto}
@@ -397,6 +431,9 @@ function renderDashboard(brokers: string[], bid: string | undefined, tree: any, 
 
   <h2 class="sec">Delegated capabilities${bid ? ` · ${esc(bid)}` : ""}</h2>
   ${forest}
+
+  <h2 class="sec">Pending approval requests</h2>
+  ${requestHtml}
 
   <h2 class="sec">Recent relayed calls</h2>
   <div class="logwrap"><div class="scroll">

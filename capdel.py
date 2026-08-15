@@ -13,6 +13,8 @@ FS_OPS = {"list", "read", "write", "stat"}
 DEF_MAX_BYTES, DEF_TIMEOUT, DEF_MAX_OUTPUT = 1 << 20, 60, 1 << 18
 OWNER_SECRET = os.environ.get("CAPDEL_OWNER_SECRET")  # gates read-only /_tree, /_audit
 REQUEST_TTL = int(os.environ.get("CAPDEL_REQUEST_TTL", 3600))  # escalation requests expire after this
+ESCALATE_HOOK = os.environ.get("CAPDEL_ESCALATE_HOOK")
+HOOK_TIMEOUT = 10
 
 # --- Proof-of-possession (HMAC-PoP), issue #4 — see tasks/pop-design-hmac.md ------------------
 # CAPDEL_POP=off (default: bearer-only, existing flows unchanged) | allow (per-request)
@@ -145,6 +147,60 @@ def audit(**kw):
     kw = {"ts": now(), **kw}
     with AUDIT.open("a") as f:
         f.write(json.dumps(kw) + "\n")
+
+
+def cap_lineage(cap):
+    lineage = []
+    while cap:
+        lineage.append(cap["id"])
+        cap = load(CAPS, cap["parent"]) if cap.get("parent") else None
+    return lineage
+
+
+def cap_audit(cap_id, n=10):
+    return [e for e in audit_tail() if e.get("cap") == cap_id][-n:]
+
+
+def fire_escalation_hook(req, cap):
+    """Notify an owner without making the hook part of the broker request path."""
+    if not ESCALATE_HOOK:
+        return
+    envelope = {
+        "granted_if_approved": req["want"],
+        "kind": "escalation.filed",
+        "request_id": req["id"],
+        "cap": {"id": cap["id"], "name": cap["name"], "lineage": cap_lineage(cap)},
+        "reason": req["reason"], "want": req["want"], "expires_at": req["expires_at"],
+        "decide": {"approve": f"capdel approve {req['id']}", "deny": f"capdel deny {req['id']}"},
+    }
+
+    def run():
+        try:
+            p = subprocess.Popen([ESCALATE_HOOK], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                p.communicate(json.dumps(envelope).encode() + b"\n", timeout=HOOK_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                p.kill(); p.communicate()
+                audit(event="hook", request=req["id"], decision="fail", reason="timeout")
+                return
+            if p.returncode:
+                audit(event="hook", request=req["id"], decision="fail", reason=f"exit {p.returncode}")
+        except (OSError, ValueError) as e:
+            audit(event="hook", request=req["id"], decision="fail", reason=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def request_view(req):
+    cap = load(CAPS, req["cap"])
+    filed_want = req.get("filed_want", req["want"])
+    return {"id": req["id"], "status": req_status(req), "granted_if_approved": filed_want,
+            "want": filed_want, "reason": req["reason"], "created": req["created"],
+            "expires_at": req["expires_at"],
+            "cap": ({"id": cap["id"], "name": cap["name"], "type": cap["type"],
+                     "lineage": cap_lineage(cap), "expires_at": cap["expires_at"],
+                     "audit": cap_audit(cap["id"])} if cap else None)}
 
 
 def all_caps(): return [json.loads(p.read_text()) for p in sorted(CAPS.glob("*.json"))]
@@ -648,6 +704,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_api/version":
             return self._json(200, {"server": self.server_version, "commit": COMMIT,
                                     "pop_mode": POP_MODE, "schemes": ["bearer", SCHEME]})
+        if path == "/_requests":
+            if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
+            pending = [request_view(json.loads(p.read_text())) for p in sorted(REQS.glob("*.json"))]
+            return self._json(200, {"requests": [r for r in pending if r["status"] == "pending"]})
         if path in ("/_tree", "/_audit"):
             if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
             return self._json(200, {"tree": tree_data()} if path == "/_tree" else {"audit": audit_tail()})
@@ -680,6 +740,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        m = re.fullmatch(r"/_requests/([\w-]+)/(approve|deny)", path)
+        if m:
+            if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
+            req = load(REQS, m.group(1))
+            if not req or req_status(req) != "pending":
+                return self._json(404, {"error": "no pending request"})
+            if m.group(2) == "deny":
+                deny_request(req)
+                return self._json(200, {"ok": True})
+            try:
+                body = self._body()
+                ttl = int(body.get("ttl_s", max(1, req["expires_at"] - now())))
+                max_ttl = max(1, req["expires_at"] - now())
+                if ttl > max_ttl:
+                    return self._json(400, {"error": "ttl exceeds the requester's remaining request TTL"})
+                cap = approve_request(req, ttl, body.get("closes_on"))
+                return self._json(200, {"ok": True, "cap_id": cap["id"]})
+            except (KeyError, ValueError, TypeError, Denied) as e:
+                return self._json(400, {"error": str(e)})
         if path == "/_event":
             # Trusted closure (§3.6): owner-filed only. A delegated holder must not be able to
             # forge the event that ends its own authority (or DoS a peer's), so this needs the
@@ -755,9 +834,11 @@ class Handler(BaseHTTPRequestHandler):
             validate_constraints(cap["type"], want)
             req = {"id": "req-" + secrets.token_hex(6), "cap": cap["id"], "type": cap["type"],
                    "want": want, "reason": body.get("reason", ""), "status": "pending",
-                   "created": now(), "expires_at": now() + REQUEST_TTL}
+                   "created": now(), "expires_at": now() + REQUEST_TTL,
+                   "filed_want": json.loads(json.dumps(want))}
             save(REQS, req)
             audit(event="escalate", cap=cap["id"], request=req["id"], want=want, reason=req["reason"])
+            fire_escalation_hook(req, cap)
             return self._json(200, {"request_id": req["id"], "status": "pending",
                                     "granted_if_approved": want,
                                     "note": "if approved, poll returns a NEW token + cap id — switch to them; your current token is unchanged",
@@ -919,10 +1000,19 @@ def cmd_approve(a):
     req = load(REQS, a.request)
     if not req: raise SystemExit(f"no such request {a.request}")
     if req_status(req) != "pending": raise SystemExit(f"request {a.request} is {req_status(req)}, not pending")
+    cap = approve_request(req, parse_ttl(a.ttl), a.closes_on, a.pop)
+    print(f"approved: minted {cap['id']} (fresh owner grant)")
+
+
+def approve_request(req, ttl_s, closes_on=None, pop=False):
     # The owner is the root of authority. An escalation exists because the needed grant
     # was NOT in the requester's chain, so approving mints it as a fresh owner capability
     # (same power as `capdel mint`) — not a sibling clamped to the requester's ancestor.
-    cap, token = mint(req["type"], req["want"], f"escalation {req['id']} for {req['cap']}", parse_ttl(a.ttl), pop=a.pop, closes_on=a.closes_on)
+    # `filed_want` is immutable evidence of what the requester asked for.  It prevents
+    # an owner-facing path from approving a request after its JSON was widened on disk.
+    filed_want = req.get("filed_want", req["want"])
+    cap, token = mint(req["type"], filed_want, f"escalation {req['id']} for {req['cap']}",
+                      ttl_s, pop=pop, closes_on=closes_on)
     # Record provenance on the minted cap so the dashboard can render the grant's
     # lineage (which request, from which cap, why) as data instead of parsing the name.
     cap["escalation"] = {"request": req["id"], "source_cap": req["cap"], "reason": req["reason"]}
@@ -937,15 +1027,19 @@ def cmd_approve(a):
     req.update(status="approved", token=token, minted_cap=cap["id"], decided=now())
     save(REQS, req)
     audit(event="approve", request=req["id"], cap=cap["id"])
-    print(f"approved: minted {cap['id']} (fresh owner grant)")
+    return cap
+
+
+def deny_request(req):
+    req.update(status="denied", decided=now())
+    save(REQS, req)
+    audit(event="deny", request=req["id"])
 
 
 def cmd_deny(a):
     req = load(REQS, a.request)
     if not req or req["status"] != "pending": raise SystemExit(f"no pending request {a.request}")
-    req.update(status="denied", decided=now())
-    save(REQS, req)
-    audit(event="deny", request=req["id"])
+    deny_request(req)
     print("denied")
 
 

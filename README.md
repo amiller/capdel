@@ -67,6 +67,9 @@ curl -H "Authorization: Bearer $TOKEN" -d '{"want":{"ops":["list","read","write"
 python3 capdel.py requests                    # see who's asking, why, and for exactly what
 python3 capdel.py approve req-e76f… --ttl 20m # mints a fresh grant
 
+# Optional push notification: the executable receives one JSON envelope on stdin.
+CAPDEL_ESCALATE_HOOK=~/bin/capdel-notify CAPDEL_OWNER_SECRET=… python3 capdel.py serve
+
 # 7. The helper polls, gets the NEW token+cap, and writes — now it works:
 curl -H "Authorization: Bearer $NEW_TOKEN" -d '{"op":"write","path":"…/summary.txt","content":"…"}' $U/caps/$NEW_CAP/invoke
 #   → {"path":"…/work/summary.txt","written":40,"created":true}
@@ -74,6 +77,12 @@ curl -H "Authorization: Bearer $NEW_TOKEN" -d '{"op":"write","path":"…/summary
 # The helper's ORIGINAL token still can't write. Revoke anything, anytime:
 python3 capdel.py revoke $ID                  # kills it and its whole subtree now
 ```
+
+The hook is fire-and-forget with a 10-second hard timeout; failures are audited and never
+break escalation. The owner-gated `/_requests` endpoint returns pending requests with the
+exact `granted_if_approved` shape first, requesting-cap lineage, and recent audit tail.
+`POST /_requests/<id>/approve` or `/deny` rules one request. Approval returns only
+`{ok, cap_id}`; the requester picks up its token through the existing poll.
 
 ## Quickstart
 

@@ -235,6 +235,14 @@ POST /caps/<id>/escalate   {"want": {…constraints…}, "reason": "need write t
 GET  /requests/<request_id>          (same token) → pending | denied | {"status":"approved","token":…,"cap":…}
 ```
 
+The broker may push an `escalation.filed` JSON envelope to the executable named by
+`CAPDEL_ESCALATE_HOOK`; it receives the exact `granted_if_approved` shape first on
+stdin and runs out-of-band with a 10-second hard timeout. Owner-gated `GET /_requests`
+returns pending requests with that shape, cap lineage, expiry, and recent audit tail.
+`POST /_requests/<id>/approve` and `/deny` share the CLI decision path. Approval is
+bounded by the immutable filed shape and returns `{ok, cap_id}` without a token; the
+requester's authenticated poll remains the only pickup path for the token.
+
 The owner sees pending requests via `capdel requests` and rules with
 `capdel approve req-… [--ttl …]` / `capdel deny req-…`. Approval mints the requested
 constraints as a **fresh owner capability** (a new root, `parent: null`) — an
