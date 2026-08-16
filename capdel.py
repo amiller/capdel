@@ -140,7 +140,16 @@ def load(kind_dir, oid):
     return json.loads(p.read_text())
 
 
-def save(kind_dir, obj): (kind_dir / f"{obj['id']}.json").write_text(json.dumps(obj, indent=1))
+def save(kind_dir, obj):
+    # Atomic write (temp file + os.replace): readers of a cap (e.g. _authn's load) take NO
+    # lock, so a plain write_text can hand them a torn half-written JSON under the #16 race
+    # (json.JSONDecodeError -> handler dies -> connection dropped). rename(2) is atomic on
+    # POSIX; the temp lives in the same dir (same fs) and is pid-suffixed so concurrent
+    # writers of the same id never share a temp. Dot-prefixed + .tmp so all_caps()'s
+    # *.json glob never sees it.
+    tmp = kind_dir / f".{obj['id']}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, kind_dir / f"{obj['id']}.json")
 
 
 @contextlib.contextmanager
