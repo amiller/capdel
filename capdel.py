@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """capdel — broker for dynamic capability delegation to agents. See SPEC.md."""
-import argparse, base64, hashlib, hmac, json, os, re, secrets, socket, ssl, subprocess, sys, threading, time
+import argparse, base64, contextlib, fcntl, hashlib, hmac, json, os, re, secrets, socket, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -140,7 +140,48 @@ def load(kind_dir, oid):
     return json.loads(p.read_text())
 
 
-def save(kind_dir, obj): (kind_dir / f"{obj['id']}.json").write_text(json.dumps(obj, indent=1))
+def save(kind_dir, obj):
+    # Atomic write (temp file + os.replace): readers of a cap (e.g. _authn's load) take NO
+    # lock, so a plain write_text can hand them a torn half-written JSON under the #16 race
+    # (json.JSONDecodeError -> handler dies -> connection dropped). rename(2) is atomic on
+    # POSIX; the temp lives in the same dir (same fs) and is pid-suffixed so concurrent
+    # writers of the same id never share a temp. Dot-prefixed + .tmp so all_caps()'s
+    # *.json glob never sees it.
+    tmp = kind_dir / f".{obj['id']}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, kind_dir / f"{obj['id']}.json")
+
+
+@contextlib.contextmanager
+def _cap_locked(cid):
+    """Per-cap cross-process advisory lock (fcntl.flock) serializing read-modify-writes of an
+    existing cap. Held by invoke's last_used stamp (record_last_used), fire_event, and
+    cmd_revoke, so a stale in-memory copy can never clobber a revoke that landed in the window
+    between the auth-time load and the save (the TOCTOU un-revoke, issue #16). Advisory locks
+    only protect writers that take them — every in-tree path that mutates an existing cap's
+    revoked state now does."""
+    d = HOME / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    lf = (d / f"{cid}.lock").open("w")
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        lf.close()
+
+
+def record_last_used(cid):
+    """Stamp last_used on the FRESHEST on-disk cap, under the per-cap lock. The cap a handler
+    holds in memory was loaded at auth time; re-saving that stale copy after a racing
+    fire_event/revoke would silently un-revoke it. Re-load under the lock and SKIP the write
+    when the cap is revoked or has vanished (issue #16)."""
+    with _cap_locked(cid):
+        fresh = load(CAPS, cid)
+        if fresh is None or fresh.get("revoked"):
+            return
+        fresh["last_used"] = now()
+        save(CAPS, fresh)
 
 
 def audit(**kw):
@@ -278,9 +319,13 @@ def fire_event(name):
         if c.get("revoked"):
             continue
         if name in (c.get("closes_on") or []):
-            c["revoked"] = True
-            save(CAPS, c)
-            closed.append(c["id"])
+            with _cap_locked(c["id"]):
+                fresh = load(CAPS, c["id"])   # re-load under lock; a concurrent writer may have moved it
+                if not fresh or fresh.get("revoked"):
+                    continue                   # lost the race — another writer already closed it
+                fresh["revoked"] = True
+                save(CAPS, fresh)
+                closed.append(fresh["id"])
     audit(event="close_event", name=name, closed=closed)
     return closed
 
@@ -812,8 +857,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "invoke":
                 result = {"fs": fs_invoke, "exec": exec_invoke, "net": net_invoke,
                           "llm": llm_invoke, "secret": secret_invoke}[cap["type"]](cap, body)
-                cap["last_used"] = now()
-                save(CAPS, cap)
+                record_last_used(cap["id"])   # locked + re-load freshest; a stale save here un-revokes (#16)
                 a = {"event": "invoke", "cap": cap["id"], "op": body.get("op"),
                      "arg": body.get("path") or body.get("argv") or body.get("host"), "decision": "allow"}
                 if body.get("op") == "connect":   # net/secret: record destination + reply size (issue #19 audit)
@@ -1044,10 +1088,11 @@ def cmd_deny(a):
 
 
 def cmd_revoke(a):
-    cap = load(CAPS, a.cap)
-    if not cap: raise SystemExit(f"no capability {a.cap}")
-    cap["revoked"] = True
-    save(CAPS, cap)
+    if not load(CAPS, a.cap): raise SystemExit(f"no capability {a.cap}")
+    with _cap_locked(a.cap):
+        cap = load(CAPS, a.cap)   # re-load freshest inside the lock so we revoke the current copy (#16)
+        cap["revoked"] = True
+        save(CAPS, cap)
     audit(event="revoke", cap=cap["id"])
     print(f"revoked {cap['id']} (and its whole subtree, checked at invoke time)")
 
