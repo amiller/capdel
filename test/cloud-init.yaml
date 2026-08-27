@@ -6,14 +6,17 @@
 #
 # Boot it with whatever you have:
 #   multipass:  multipass launch --name capdel --cloud-init test/cloud-init.yaml 24.04
-#   qemu:       cloud-localds seed.img test/cloud-init.yaml && qemu-system-x86_64 \
-#                 -m 2G -drive file=noble-server-cloudimg-amd64.img -drive file=seed.img,format=raw \
-#                 -netdev user,id=n,hostfwd=tcp::4571-:4571 -device virtio-net,netdev=n
+#   qemu:       bash test/vm.sh            (builds the seed with genisoimage, KVM, hostfwd)
+#   manual:     genisoimage -output seed.iso -volid CIDATA -joliet -rock user-data meta-data
+#               qemu-system-x86_64 -enable-kvm -m 2G -snapshot \
+#                 -drive file=noble-server-cloudimg-amd64.img,if=virtio \
+#                 -drive file=seed.iso,format=raw,if=virtio,readonly=on \
+#                 -netdev user,id=n,hostfwd=tcp::4571-:4571 -device virtio-net-pci,netdev=n
 #   any cloud:  paste as user-data.
 #
 # Then the broker is on <vm-ip>:4571 with owner secret below (CHANGE IT for anything real).
 package_update: true
-packages: [python3, git, curl]
+packages: [git]
 write_files:
   - path: /etc/capdel.env
     permissions: "0600"
@@ -32,7 +35,8 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 runcmd:
-  - git clone --depth 1 https://github.com/amiller/capdel /opt/capdel
+  # test/vm.sh swaps `-b main` for the branch under test before building the seed ISO.
+  - git clone --depth 1 -b main https://github.com/amiller/capdel /opt/capdel
   - install -d -m 700 /var/lib/capdel
   - install -d /srv/demo/pub /srv/demo/work
   - sh -c 'echo "public note" > /srv/demo/pub/readme.txt'

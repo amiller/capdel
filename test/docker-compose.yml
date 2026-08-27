@@ -1,37 +1,76 @@
-# Swarm workers as isolated containers. Each worker gets ONLY CAPDEL_URL + a scoped
-# token + a plan — no source, no credentials, no path to the host but the broker. This is
-# the realistic shape: capdel bounds what the token reaches, the container bounds what the
-# process reaches. Point CAPDEL_URL at a broker on the host or the pod relay.
+# Swarm test rig (issue #9). The broker container is the DISPOSABLE OWNER HOST: throwaway
+# state volume, throwaway content volume, the repo's capdel.py bind-mounted in, exec caps
+# can do anything inside it. Each worker container gets ONLY CAPDEL_URL + its scoped token
+# and sits on its OWN internal:true network shared with nothing but the broker — no route
+# to the internet, no route to the other workers, exactly the "egress limited to the
+# broker" shape (the token bounds what it reaches on the owner host; the network bounds
+# what the process reaches at all).
 #
-#   1. run a broker somewhere reachable (host: `python3 capdel.py serve --bind 0.0.0.0:4571`)
-#   2. mint a token per worker, export them, then:  docker compose up --build
-#
-# The tokens are injected from your shell env so nothing sensitive is baked into the image.
+# Driven end-to-end by `python3 test/scenario.py` (mints via POST /_mint, launches all
+# workers at once, approves the escalation under load, collects the matrices). Manual
+# poking: `docker compose -f test/docker-compose.yml --env-file test/.env up broker echo`.
+name: capdel-swarm
+
+x-worker: &worker
+  build: {context: .., dockerfile: test/Dockerfile.worker}
+  volumes: ["${RESULTS_DIR:?set RESULTS_DIR (scenario.py writes test/.env)}:/results"]
+
 services:
-  reader:
-    build: {context: ., dockerfile: Dockerfile.worker}
+  broker:
+    image: python:3.12-alpine
+    working_dir: /app
+    volumes: ["../capdel.py:/app/capdel.py:ro", "state:/state", "content:/content"]
     environment:
-      CAPDEL_URL: ${CAPDEL_URL:?set CAPDEL_URL}
-      CAPDEL_TOKEN: ${READER_TOKEN:?set READER_TOKEN}
-      CAP_ID: ${READER_CAP:?set READER_CAP}
-      WORKER_PLAN: |
-        {"op":"list","path":"/data/pub"}|200
-        {"op":"read","path":"/data/work/seed.txt"}|403
-    networks: [swarm]
+      CAPDEL_HOME: /state
+      CAPDEL_OWNER_SECRET: ${CAPDEL_OWNER_SECRET:?}
+      CAPDEL_COMMIT: ${CAPDEL_COMMIT:?}   # /_api/version pin; no .git inside the image
+    command: >
+      sh -c 'mkdir -p /content/pub /content/work &&
+             printf "public note\n" > /content/pub/readme.txt &&
+             printf "work seed\n"   > /content/work/seed.txt &&
+             exec python3 /app/capdel.py serve --bind 0.0.0.0:4571'
+    ports: ["127.0.0.1:${CAPDEL_HOST_PORT:?}:4571"]   # owner ops + transcript, localhost only
+    networks: [mgmt, w_reader, w_writer, w_exec, w_net, w_escalator]
 
-  writer:
-    build: {context: ., dockerfile: Dockerfile.worker}
-    environment:
-      CAPDEL_URL: ${CAPDEL_URL}
-      CAPDEL_TOKEN: ${WRITER_TOKEN:?set WRITER_TOKEN}
-      CAP_ID: ${WRITER_CAP:?set WRITER_CAP}
-      WORKER_PLAN: |
-        {"op":"write","path":"/data/work/out.txt","content":"hi"}|200
-        {"op":"read","path":"/data/pub/readme.txt"}|403
-    networks: [swarm]
+  # One-shot TCP echo on the net worker's island: the net cap relays through the broker
+  # to it (one brokered connection per invoke — SPEC 3.1 net), and nothing else can reach it.
+  echo:
+    image: python:3.12-alpine
+    command: ["python3", "-u", "-c", "import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('0.0.0.0', 9000)); s.listen(16)\nwhile True:\n    c, _ = s.accept()\n    c.sendall(c.recv(4096))\n    c.close()"]
+    networks: [w_net]
 
-# Workers can only reach the broker over this network — not each other's targets, not the
-# wider internet. Egress confinement is the container's job; scope is the token's job.
+  worker-reader:
+    <<: *worker
+    environment: {CAPDEL_URL: "http://broker:4571", CAPDEL_TOKEN: "${READER_TOKEN:-}"}
+    networks: [w_reader]
+  worker-writer:
+    <<: *worker
+    environment: {CAPDEL_URL: "http://broker:4571", CAPDEL_TOKEN: "${WRITER_TOKEN:-}"}
+    networks: [w_writer]
+  worker-exec:
+    <<: *worker
+    environment: {CAPDEL_URL: "http://broker:4571", CAPDEL_TOKEN: "${EXEC_TOKEN:-}"}
+    networks: [w_exec]
+  worker-net:
+    <<: *worker
+    environment: {CAPDEL_URL: "http://broker:4571", CAPDEL_TOKEN: "${NET_TOKEN:-}"}
+    networks: [w_net]
+  worker-escalator:
+    <<: *worker
+    environment: {CAPDEL_URL: "http://broker:4571", CAPDEL_TOKEN: "${ESCALATOR_TOKEN:-}"}
+    networks: [w_escalator]
+
+volumes: {state: {}, content: {}}
+
+# internal:true = no external routing at all: a worker's only reachable peer is the broker.
+# Explicit subnets: this box's docker daemon has exhausted its predefined address pools, and
+# pinned /24s in 10.201.0.0/24.. keep the five islands small and collision-checked by hand.
+# `mgmt` is the one NON-internal net: docker will not publish ports for a container that is
+# only on internal networks (the owner host is not a confined worker — it may be reachable).
 networks:
-  swarm:
-    driver: bridge
+  mgmt:        {ipam: {config: [{subnet: 10.201.5.0/24}]}}
+  w_reader:    {internal: true, ipam: {config: [{subnet: 10.201.0.0/24}]}}
+  w_writer:    {internal: true, ipam: {config: [{subnet: 10.201.1.0/24}]}}
+  w_exec:      {internal: true, ipam: {config: [{subnet: 10.201.2.0/24}]}}
+  w_net:       {internal: true, ipam: {config: [{subnet: 10.201.3.0/24}]}}
+  w_escalator: {internal: true, ipam: {config: [{subnet: 10.201.4.0/24}]}}

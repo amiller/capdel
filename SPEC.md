@@ -389,7 +389,9 @@ POST /caps/<id>/invoke      Bearer <token>   {"op": …, …}         → result
 POST /caps/<id>/attenuate   Bearer <token>   {"constraints":…, "name":…, "ttl_s":…} → {id, token}
 POST /caps/<id>/escalate    Bearer <token>   {"want":…, "reason":…}                → {request_id}
 GET  /caps/<id>             Bearer <token>                        → self-description + how
+GET  /whoami                Bearer <token>                        → self-description (token-keyed; for holders whose env is only URL+token, SPEC 3.8)
 GET  /requests/<rid>        Bearer <token of requesting cap>      → status [+ token]
+GET  /_api/version                                                → {server, commit, pop_mode, schemes} (commit = CAPDEL_COMMIT env, else git)
 POST /_event                Bearer <owner-secret>   {"name":…}                     → {event, closed[], count}   # trusted closure
 ```
 
