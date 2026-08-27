@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """capdel — broker for dynamic capability delegation to agents. See SPEC.md."""
-import argparse, base64, contextlib, fcntl, hashlib, hmac, json, os, re, secrets, socket, ssl, subprocess, sys, threading, time
+import argparse, base64, contextlib, ctypes, fcntl, hashlib, hmac, json, os, re, secrets, signal, socket, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -354,6 +354,11 @@ def validate_constraints(type_, c):
             raise Denied("exec 'allow' must be a non-empty list of argv prefixes (lists of strings)")
         if not (isinstance(c.get("cwd_root"), str) and os.path.isabs(c["cwd_root"])):
             raise Denied("exec constraints need an absolute 'cwd_root'")
+        if not isinstance(c.get("deny_syscalls", []), list) or any(not isinstance(name, str) for name in c.get("deny_syscalls", [])):
+            raise Denied("exec 'deny_syscalls' must contain syscall names")
+        for key in ("cpu_quota_us", "memory_max_bytes"):
+            if key in c and (not isinstance(c[key], int) or c[key] <= 0):
+                raise Denied(f"exec {key} must be a positive integer")
     elif type_ == "net":
         allow = c.get("allow")
         if not allow or not all(isinstance(a, list) and len(a) == 2 and isinstance(a[0], str)
@@ -402,6 +407,13 @@ def check_subset(type_, child, parent_cap):
             raise Denied("timeout_s exceeds parent's")
         if child.get("max_output", DEF_MAX_OUTPUT) > p.get("max_output", DEF_MAX_OUTPUT):
             raise Denied("max_output exceeds parent's")
+        if not set(child.get("deny_syscalls", [])) >= set(p.get("deny_syscalls", [])):
+            raise Denied("exec deny_syscalls may only be narrowed")
+        for key in ("cpu_quota_us", "memory_max_bytes"):
+            if key in child and (key not in p or child[key] >= p[key]):
+                raise Denied(f"{key} may only be narrowed")
+            if key not in child and key in p:
+                raise Denied(f"{key} cannot be removed from a child capability")
     elif type_ == "net":
         for ch, cp in child["allow"]:
             if not any(ph == ch and (pp == 0 or pp == cp) for ph, pp in p["allow"]):
@@ -516,6 +528,119 @@ def fs_invoke(cap, body):
     return {"path": rp, "written": len(data), "created": created}
 
 
+_LANDLOCK_CREATE_RULESET = 444
+_LANDLOCK_ADD_RULE = 445
+_LANDLOCK_RESTRICT_SELF = 446
+_LANDLOCK_RULE_PATH_BENEATH = 1
+_LANDLOCK_ACCESS = 0x1FFF  # Landlock ABI 1, available on kernels >= 5.13.
+_O_PATH = 0o10000000
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+class _LandlockAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64), ("handled_access_net", ctypes.c_uint64)]
+
+
+class _LandlockPath(ctypes.Structure):
+    _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int)]
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte), ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(_SockFilter))]
+
+
+def _syscall(number, *args):
+    result = _libc.syscall(number, *args)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
+
+
+def _apply_landlock(root):
+    if sys.platform != "linux":
+        raise OSError("kernel-backed exec confinement requires Linux")
+    attr = _LandlockAttr(_LANDLOCK_ACCESS, 0)
+    ruleset = _syscall(_LANDLOCK_CREATE_RULESET, ctypes.byref(attr), ctypes.sizeof(attr), 0)
+    try:
+        paths = [root, "/usr", "/bin", "/lib", "/lib64"]
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            fd = os.open(path, _O_PATH | _O_CLOEXEC)
+            try:
+                access = _LANDLOCK_ACCESS if path == root else 1 | 4 | 8
+                rule = _LandlockPath(access, fd)
+                _syscall(_LANDLOCK_ADD_RULE, ctypes.c_int(ruleset), _LANDLOCK_RULE_PATH_BENEATH,
+                         ctypes.byref(rule), 0)
+            finally:
+                os.close(fd)
+        _libc.prctl(38, 1, 0, 0, 0)
+        _syscall(_LANDLOCK_RESTRICT_SELF, ruleset, 0)
+    finally:
+        os.close(ruleset)
+
+
+_SYSCALLS_X86_64 = {"getpid": 39, "mount": 165, "umount2": 166, "ptrace": 101,
+                    "unshare": 272, "setns": 308, "bpf": 321, "open_by_handle_at": 304}
+
+
+def _apply_seccomp(names):
+    unknown = sorted(set(names) - _SYSCALLS_X86_64.keys())
+    if unknown:
+        raise OSError(f"unsupported syscall names on this architecture: {unknown}")
+    if not names:
+        return
+    # Load syscall number; kill with SIGSYS on a named syscall; allow all other calls.
+    instructions = [_SockFilter(0x20, 0, 0, 0)]
+    for name in names:
+        instructions.extend((_SockFilter(0x15, 0, 1, _SYSCALLS_X86_64[name]),
+                             _SockFilter(0x06, 0, 0, 0x00030000 | signal.SIGSYS)))
+    instructions.append(_SockFilter(0x06, 0, 0, 0x7fff0000))
+    array = (_SockFilter * len(instructions))(*instructions)
+    program = _SockFprog(len(instructions), array)
+    if _libc.prctl(38, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    _syscall(157, 22, 1, ctypes.byref(program))
+
+
+def apply_kernel_limits(constraints):
+    _apply_landlock(constraints["cwd_root"])
+    _apply_seccomp(constraints.get("deny_syscalls", []))
+
+
+class _Cgroup:
+    def __init__(self, path): self.path = path
+    def cleanup(self):
+        self.path.rmdir()
+
+
+def attach_cgroup(pid, constraints):
+    if not any(key in constraints for key in ("cpu_quota_us", "memory_max_bytes")):
+        return None
+    root = Path("/sys/fs/cgroup")
+    if not (root / "cgroup.controllers").exists():
+        raise OSError("cgroup v2 is required for exec resource limits")
+    path = root / f"capdel-{os.getpid()}-{pid}"
+    path.mkdir()
+    try:
+        if "cpu_quota_us" in constraints:
+            (path / "cpu.max").write_text(f"{constraints['cpu_quota_us']} 100000")
+        if "memory_max_bytes" in constraints:
+            (path / "memory.max").write_text(str(constraints["memory_max_bytes"]))
+        (path / "cgroup.procs").write_text(str(pid))
+    except BaseException:
+        path.rmdir()
+        raise
+    return _Cgroup(path)
+
+
 def exec_invoke(cap, body):
     c, argv = cap["constraints"], body["argv"]
     if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
@@ -523,11 +648,24 @@ def exec_invoke(cap, body):
     if not any(argv[:len(pref)] == pref for pref in c["allow"]):
         raise Denied(f"argv {argv[:3]}… does not extend any allowed prefix {c['allow']}")
     cwd = resolve_inside(c["cwd_root"], body.get("cwd", c["cwd_root"]))
-    r = subprocess.run(argv, cwd=cwd, input=body.get("stdin"), capture_output=True,
-                       text=True, timeout=c.get("timeout_s", DEF_TIMEOUT))
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if body.get("stdin") is not None else None,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            preexec_fn=lambda: apply_kernel_limits(c))
+    try:
+        cgroup = attach_cgroup(proc.pid, c)
+    except BaseException:
+        proc.kill(); proc.wait()
+        raise
+    try:
+        stdout, stderr = proc.communicate(body.get("stdin"), timeout=c.get("timeout_s", DEF_TIMEOUT))
+    except subprocess.TimeoutExpired:
+        proc.kill(); proc.communicate()
+        raise
+    finally:
+        if cgroup: cgroup.cleanup()
     mo = c.get("max_output", DEF_MAX_OUTPUT)
-    return {"code": r.returncode, "stdout": r.stdout[:mo], "stderr": r.stderr[:mo],
-            "truncated": len(r.stdout) > mo or len(r.stderr) > mo}
+    return {"code": proc.returncode, "stdout": stdout[:mo], "stderr": stderr[:mo],
+            "truncated": len(stdout) > mo or len(stderr) > mo}
 
 
 def net_invoke(cap, body):
@@ -896,6 +1034,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": str(e)})
         except subprocess.TimeoutExpired as e:
             return self._json(408, {"error": f"timed out after {e.timeout}s"})
+        except subprocess.SubprocessError as e:
+            return self._json(502, {"error": f"kernel confinement failed: {e}"})
         except TimeoutError:
             return self._json(408, {"error": "connection timed out (peer may not have closed; send Connection: close)"})
         except OSError as e:
@@ -990,6 +1130,9 @@ def cmd_mint(a):
     elif a.type == "exec":
         constraints = {"allow": [al.split() for al in a.allow], "cwd_root": os.path.realpath(a.cwd_root)}
         if a.timeout: constraints["timeout_s"] = a.timeout
+        if a.deny_syscall: constraints["deny_syscalls"] = a.deny_syscall
+        if a.cpu_quota_us: constraints["cpu_quota_us"] = a.cpu_quota_us
+        if a.memory_max_bytes: constraints["memory_max_bytes"] = a.memory_max_bytes
     elif a.type == "net":
         constraints = {"allow": [parse_dest(al) for al in a.allow]}
         if a.max_bytes: constraints["max_bytes"] = a.max_bytes
@@ -1185,6 +1328,9 @@ def main():
     s.add_argument("type", choices=["fs", "exec", "net", "llm"])
     s.add_argument("--root"); s.add_argument("--ops", default="list,read"); s.add_argument("--max-bytes", type=int, dest="max_bytes")
     s.add_argument("--allow", action="append", default=[]); s.add_argument("--cwd-root", dest="cwd_root"); s.add_argument("--timeout", type=int)
+    s.add_argument("--deny-syscall", action="append", default=[], dest="deny_syscall")
+    s.add_argument("--cpu-quota-us", type=int, dest="cpu_quota_us")
+    s.add_argument("--memory-max-bytes", type=int, dest="memory_max_bytes")
     s.add_argument("--models", action="append", default=[], help="llm: allowed model name(s), repeatable or comma-sep")
     s.add_argument("--base-url", dest="base_url", help="llm: OpenAI-compatible base (default z.ai coding paas)")
     s.add_argument("--max-tokens", type=int, dest="max_tokens", help="llm: cap max_tokens per call")

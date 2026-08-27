@@ -56,3 +56,7 @@ multipass launch --name capdel --cloud-init test/cloud-init.yaml 24.04
 | local `swarm.py` | scope enforcement + concurrency + escalation | every change (CI) |
 | containers | worker-process isolation composes with token scope | before trusting a real worker |
 | VM | destructive-safe exec + a real kernel for confinement | testing #8, swarm at scale |
+
+For issue #8, run `python3 test/kernel.py` inside the disposable VM. It asserts that an
+indirect outside-root read is refused by Landlock and that a denied syscall terminates
+with `SIGSYS`; resource-limit coverage requires a writable cgroup-v2 hierarchy.
