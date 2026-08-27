@@ -44,7 +44,7 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -display none -daemonize
   -pidfile "$WORK/qemu.pid" -snapshot \
   -drive "file=$IMG_CACHE,if=virtio" \
   -drive "file=$WORK/seed.iso,format=raw,if=virtio,readonly=on" \
-  -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${PORT}-:4571" -device virtio-net-pcie,netdev=n0
+  -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${PORT}-:4571" -device virtio-net-pci,netdev=n0
 
 cleanup() { [ -f "$WORK/qemu.pid" ] && kill "$(cat "$WORK/qemu.pid")" 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
