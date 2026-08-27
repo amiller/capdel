@@ -974,7 +974,7 @@ class Handler(BaseHTTPRequestHandler):
         return fwd if fwd else f"http://{self.headers.get('Host', self.server.server_address[0])}"
 
     def _owner_ok(self):
-        return bool(OWNER_SECRET) and self._token() == OWNER_SECRET
+        return bool(OWNER_SECRET) and hmac.compare_digest(self._token().encode(), OWNER_SECRET.encode())
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
