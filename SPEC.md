@@ -56,8 +56,8 @@ R8. **Cheap.** No per-capability container. Enforcement happens in one broker
     agent process itself, not the mechanism of authority.
 
 Non-goals for v0: browser-cookie/account delegation (that's oauth3's lane), offline
-attenuation (Biscuit-style), multi-user federation, quotas/metering (R-future),
-signed audit.
+attenuation (Biscuit-style), multi-user federation, signed audit. Exec resource limits
+are implemented by the platform-specific annex below; disk I/O quotas remain future work.
 
 ## 3. Design
 
@@ -335,6 +335,18 @@ brokered, audited, attenuated one. Per-capability cost is a JSON record, not a
 container (the overhead comparison from the discussion — Deno ~shared runtime,
 Docker ~30–50 MB, LXC weaker isolation — applies to confining agents, not to
 capabilities).
+
+#### Platform enforcement for exec capabilities
+
+On Linux, every `exec` invoke creates the child under an unprivileged Landlock
+ABI-1 ruleset rooted at `cwd_root`. The root is granted the capability's filesystem
+access; only the interpreter and loader directories (`/usr`, `/bin`, `/lib`, `/lib64`)
+are granted read/execute access needed to start ordinary commands. The child may also
+install a seccomp-BPF deny list via `deny_syscalls`; a denied syscall terminates with
+`SIGSYS`. `cpu_quota_us` and `memory_max_bytes` use a private cgroup-v2 subtree.
+If the kernel primitive or requested cgroup is unavailable, the invoke fails loudly;
+there is no userspace fallback. Disk-I/O quotas and broker self-confinement are out of
+scope and tracked separately.
 
 ## 4. Security model
 
