@@ -11,7 +11,7 @@
 #               qemu-system-x86_64 -enable-kvm -m 2G -snapshot \
 #                 -drive file=noble-server-cloudimg-amd64.img,if=virtio \
 #                 -drive file=seed.iso,format=raw,if=virtio,readonly=on \
-#                 -netdev user,id=n,hostfwd=tcp::4571-:4571 -device virtio-net-pcie,netdev=n
+#                 -netdev user,id=n,hostfwd=tcp::4571-:4571 -device virtio-net-pci,netdev=n
 #   any cloud:  paste as user-data.
 #
 # Then the broker is on <vm-ip>:4571 with owner secret below (CHANGE IT for anything real).
