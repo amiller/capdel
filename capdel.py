@@ -607,7 +607,10 @@ def _apply_seccomp(names):
     if _libc.prctl(38, 1, 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    _syscall(157, 22, 1, ctypes.byref(program))
+    # seccomp(SECCOMP_SET_MODE_FILTER) is x86_64 syscall 317. prctl's mode constants differ:
+    # prctl(PR_SET_SECCOMP, 1, …) selects STRICT mode, which ignores the program and
+    # SIGKILLs the child on any syscall outside read/write/exit.
+    _syscall(317, 1, 0, ctypes.byref(program))
 
 
 def apply_kernel_limits(constraints):
