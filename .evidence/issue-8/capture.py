@@ -86,7 +86,7 @@ cid, tok = mint_exec("cat")
 P("## exec cap scoped to the root, indirect outside reads\n")
 P(f"```$ capdel mint exec --allow cat --cwd-root {ROOT_DIR}   →  id={cid} token=ct-…```\n")
 for label, argv in [("symlink read `cat leak`", ["cat", "leak"]),
-                    ("dotdot read `cat ../vault/secret.txt`", ["cat", "../vault/secret.txt"])]:
+                    ("dotdot read `cat ../../vault/secret.txt`", ["cat", "../../vault/secret.txt"])]:
     st, d = invoke(tok, cid, argv)
     P(f"$ POST /caps/{cid}/invoke {{\"argv\": {json.dumps(argv)}}} → HTTP {st} ```json\n{json.dumps(d, indent=2)}\n```")
     if mode == "before":
