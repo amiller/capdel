@@ -34,7 +34,7 @@ def _git_commit():
         return "unknown"
 
 
-COMMIT = _git_commit()
+COMMIT = os.environ.get("CAPDEL_COMMIT") or _git_commit()  # env pin wins: bundled/container deploys have no .git
 
 # The agent-side signer, served verbatim at GET /capdel-sign and inlined into a PoP cap's
 # self-description, so an agent with only CAPDEL_URL + CAPDEL_TOKEN can bootstrap itself.
@@ -890,6 +890,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_api/version":
             return self._json(200, {"server": self.server_version, "commit": COMMIT,
                                     "pop_mode": POP_MODE, "schemes": ["bearer", SCHEME]})
+        if path == "/whoami":
+            # Token-keyed self-description: a worker whose environment is ONLY
+            # CAPDEL_URL + CAPDEL_TOKEN (no cap id — the SPEC 3.8 shape) can still
+            # discover what it holds. Tries each cap; a PoP cap must verify.
+            for cap in all_caps():
+                try:
+                    if cap.get("pop"):
+                        verify_pop(cap, "GET", "/whoami", b"", self.headers)
+                    elif not (cap.get("token_sha256")
+                              and hmac.compare_digest(sha(self._token()), cap["token_sha256"])):
+                        continue
+                except Denied:
+                    continue
+                return self._json(200, describe(cap, self._base()))
+            return self._json(401, {"error": "no capability holds this token"})
         if path == "/_requests":
             if not self._owner_ok(): return self._json(401, {"error": "owner secret required"})
             pending = [request_view(json.loads(p.read_text())) for p in sorted(REQS.glob("*.json"))]
