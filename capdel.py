@@ -643,6 +643,7 @@ _BROKER_SYSCALLS = {
     "getpid": 39, "sendfile": 40, "socket": 41, "connect": 42,
     "accept": 43, "sendto": 44, "recvfrom": 45, "sendmsg": 46,
     "recvmsg": 47, "shutdown": 48, "bind": 49, "listen": 50,
+    "sendmmsg": 307, "recvmmsg": 299,  # glibc ≥2.39 resolver batches A+AAAA via sendmmsg
     "getsockname": 51, "getpeername": 52, "socketpair": 53, "setsockopt": 54,
     "getsockopt": 55, "clone": 56, "fork": 57, "vfork": 58,
     "execve": 59, "exit": 60, "wait4": 61, "kill": 62,
