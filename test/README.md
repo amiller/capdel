@@ -21,7 +21,10 @@ non-zero on any failure, touches only a tempdir (never `~/.capdel`).
 
 Kernel note: exec caps are kernel-confined (Landlock, #23) and the broker fails LOUDLY on
 kernels without it — on such hosts the allowlisted-exec check prints `[SKIP]` with the
-reason instead of failing; the VM tier covers it on a real kernel.
+reason instead of failing; the VM tier covers it on a real kernel. Broker self-confinement
+(#24) is likewise kernel-tier: `test/kernel_broker.py` runs an unconfined and a
+`--self-confinement` broker side by side on the VM and asserts an outside-root read flips
+from leak to kernel-denied.
 
 ## Tier 2 — worker isolation containers (`scenario.py` drives it)
 
@@ -59,7 +62,9 @@ bash test/vm.sh [branch]     # boots qemu/KVM, waits for the broker, runs exec-c
 Checks run host-side against the forwarded broker port: an allowlisted exec runs,
 a non-allowlisted exec is denied by policy, and — the part only a real kernel can prove —
 `ls /etc` **fails under the sandbox** even though `ls` is allowlisted (Landlock blocks the
-read outside the granted paths).
+read outside the granted paths). Since #24 the VM broker itself runs self-confined, and
+`vm.sh` adds broker-side checks: an outside-root read is kernel-denied, a working-set root
+reads fine, and an exec child syscall outside the broker allowlist dies with SIGSYS.
 
 ## What each tier is for
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """capdel — broker for dynamic capability delegation to agents. See SPEC.md."""
-import argparse, base64, contextlib, ctypes, fcntl, hashlib, hmac, json, os, re, secrets, signal, socket, ssl, subprocess, sys, threading, time
+import argparse, base64, contextlib, ctypes, fcntl, hashlib, hmac, json, os, platform, re, secrets, signal, socket, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -562,19 +562,22 @@ def _syscall(number, *args):
     return result
 
 
-def _apply_landlock(root):
+_SYSTEM_RO = ("/usr", "/bin", "/lib", "/lib64")  # read+execute: interpreter & loader dirs
+
+
+def _apply_landlock(rules):
+    """rules: [(path, allowed_access)] — restrict the calling thread (and everything it
+    spawns) to the union of the rules. Paths that do not exist on this host are skipped."""
     if sys.platform != "linux":
         raise OSError("kernel-backed exec confinement requires Linux")
     attr = _LandlockAttr(_LANDLOCK_ACCESS, 0)
     ruleset = _syscall(_LANDLOCK_CREATE_RULESET, ctypes.byref(attr), ctypes.sizeof(attr), 0)
     try:
-        paths = [root, "/usr", "/bin", "/lib", "/lib64"]
-        for path in paths:
+        for path, access in rules:
             if not os.path.exists(path):
                 continue
             fd = os.open(path, _O_PATH | _O_CLOEXEC)
             try:
-                access = _LANDLOCK_ACCESS if path == root else 1 | 4 | 8
                 rule = _LandlockPath(access, fd)
                 _syscall(_LANDLOCK_ADD_RULE, ctypes.c_int(ruleset), _LANDLOCK_RULE_PATH_BENEATH,
                          ctypes.byref(rule), 0)
@@ -590,6 +593,18 @@ _SYSCALLS_X86_64 = {"getpid": 39, "mount": 165, "umount2": 166, "ptrace": 101,
                     "unshare": 272, "setns": 308, "bpf": 321, "open_by_handle_at": 304}
 
 
+def _load_seccomp_filter(instructions):
+    array = (_SockFilter * len(instructions))(*instructions)
+    program = _SockFprog(len(instructions), array)
+    if _libc.prctl(38, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # seccomp(SECCOMP_SET_MODE_FILTER) is x86_64 syscall 317. prctl's mode constants differ:
+    # prctl(PR_SET_SECCOMP, 1, …) selects STRICT mode, which ignores the program and
+    # SIGKILLs the child on any syscall outside read/write/exit.
+    _syscall(317, 1, 0, ctypes.byref(program))
+
+
 def _apply_seccomp(names):
     unknown = sorted(set(names) - _SYSCALLS_X86_64.keys())
     if unknown:
@@ -602,20 +617,97 @@ def _apply_seccomp(names):
         instructions.extend((_SockFilter(0x15, 0, 1, _SYSCALLS_X86_64[name]),
                              _SockFilter(0x06, 0, 0, 0x00030000 | signal.SIGSYS)))
     instructions.append(_SockFilter(0x06, 0, 0, 0x7fff0000))
-    array = (_SockFilter * len(instructions))(*instructions)
-    program = _SockFprog(len(instructions), array)
-    if _libc.prctl(38, 1, 0, 0, 0) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-    # seccomp(SECCOMP_SET_MODE_FILTER) is x86_64 syscall 317. prctl's mode constants differ:
-    # prctl(PR_SET_SECCOMP, 1, …) selects STRICT mode, which ignores the program and
-    # SIGKILLs the child on any syscall outside read/write/exit.
-    _syscall(317, 1, 0, ctypes.byref(program))
+    _load_seccomp_filter(instructions)
 
 
 def apply_kernel_limits(constraints):
-    _apply_landlock(constraints["cwd_root"])
+    _apply_landlock([(constraints["cwd_root"], _LANDLOCK_ACCESS)] +
+                    [(p, 1 | 4 | 8) for p in _SYSTEM_RO])
     _apply_seccomp(constraints.get("deny_syscalls", []))
+
+
+# Broker self-confinement syscall floor (#24): anything a Python stdlib server, its request
+# threads, and the ordinary commands an exec cap may spawn actually call — plus the
+# confinement syscalls themselves (landlock/seccomp/prctl, so exec children can stack their
+# own rules). Notably absent: ptrace, mount, bpf, keyctl, setuid-family, io_uring, perf.
+# x86_64 numbers only, like _SYSCALLS_X86_64 above.
+_BROKER_SYSCALLS = {
+    "read": 0, "write": 1, "open": 2, "close": 3,
+    "stat": 4, "fstat": 5, "lstat": 6, "poll": 7,
+    "lseek": 8, "mmap": 9, "mprotect": 10, "munmap": 11,
+    "brk": 12, "rt_sigaction": 13, "rt_sigprocmask": 14, "rt_sigreturn": 15,
+    "ioctl": 16, "pread64": 17, "pwrite64": 18, "readv": 19,
+    "writev": 20, "access": 21, "pipe": 22, "select": 23,
+    "sched_yield": 24, "mremap": 25, "msync": 26, "mincore": 27,
+    "madvise": 28, "dup": 32, "dup2": 33, "nanosleep": 35,
+    "getpid": 39, "sendfile": 40, "socket": 41, "connect": 42,
+    "accept": 43, "sendto": 44, "recvfrom": 45, "sendmsg": 46,
+    "recvmsg": 47, "shutdown": 48, "bind": 49, "listen": 50,
+    "getsockname": 51, "getpeername": 52, "socketpair": 53, "setsockopt": 54,
+    "getsockopt": 55, "clone": 56, "fork": 57, "vfork": 58,
+    "execve": 59, "exit": 60, "wait4": 61, "kill": 62,
+    "uname": 63, "fcntl": 72, "flock": 73, "fsync": 74,
+    "fdatasync": 75, "truncate": 76, "ftruncate": 77, "getdents": 78,
+    "getcwd": 79, "chdir": 80, "fchdir": 81, "rename": 82,
+    "mkdir": 83, "rmdir": 84, "creat": 85, "link": 86,
+    "unlink": 87, "symlink": 88, "readlink": 89, "chmod": 90,
+    "fchmod": 91, "chown": 92, "fchown": 93, "lchown": 94,
+    "umask": 95, "gettimeofday": 96, "getrlimit": 97, "getrusage": 98,
+    "sysinfo": 99, "times": 100, "getuid": 102, "getgid": 104,
+    "geteuid": 107, "getegid": 108, "getppid": 110, "getpgrp": 111,
+    "setsid": 112, "getgroups": 115, "rt_sigpending": 127, "rt_sigtimedwait": 128,
+    "rt_sigsuspend": 130, "sigaltstack": 131, "statfs": 137, "fstatfs": 138,
+    "prctl": 157, "arch_prctl": 158, "gettid": 186, "futex": 202,
+    "sched_getaffinity": 204, "epoll_create": 213, "getdents64": 217, "set_tid_address": 218,
+    "restart_syscall": 219, "fadvise64": 221, "clock_gettime": 228, "clock_getres": 229,
+    "clock_nanosleep": 230, "exit_group": 231, "epoll_wait": 232, "epoll_ctl": 233,
+    "tgkill": 234, "waitid": 247, "openat": 257, "mkdirat": 258,
+    "fchownat": 260, "newfstatat": 262, "unlinkat": 263, "renameat": 264,
+    "linkat": 265, "symlinkat": 266, "readlinkat": 267, "fchmodat": 268,
+    "faccessat": 269, "pselect6": 270, "ppoll": 271, "set_robust_list": 273,
+    "utimensat": 280, "epoll_pwait": 281, "fallocate": 285, "accept4": 288,
+    "epoll_create1": 291, "dup3": 292, "pipe2": 293, "prlimit64": 302,
+    "renameat2": 316, "seccomp": 317, "getrandom": 318, "execveat": 322,
+    "copy_file_range": 326, "statx": 332, "rseq": 334, "clone3": 435,
+    "close_range": 436, "faccessat2": 439, "epoll_pwait2": 441,
+}
+
+
+def _apply_seccomp_allowlist():
+    if platform.machine() not in ("x86_64", "amd64"):
+        raise OSError("self-confinement syscall allowlist is x86_64-only")
+    # Allow exactly the floor above (plus the Landlock syscalls exec children need); any other
+    # syscall terminates the calling thread with SIGSYS. Stacks with per-cap deny lists:
+    # a child must clear BOTH filters.
+    allowed = set(_BROKER_SYSCALLS.values()) | {_LANDLOCK_CREATE_RULESET,
+                                                _LANDLOCK_ADD_RULE, _LANDLOCK_RESTRICT_SELF}
+    instructions = [_SockFilter(0x20, 0, 0, 0)]
+    for nr in sorted(allowed):
+        instructions.extend((_SockFilter(0x15, 0, 1, nr), _SockFilter(0x06, 0, 0, 0x7fff0000)))
+    instructions.append(_SockFilter(0x06, 0, 0, 0x00030000 | signal.SIGSYS))
+    _load_seccomp_filter(instructions)
+
+
+def apply_self_confinement(extra_roots=()):
+    """#24: confine the broker process itself, before any request thread exists (every thread
+    and exec child inherits both filters). Landlock bounds the broker's filesystem reach to
+    its working set; seccomp bounds its syscalls to an allowlist. There is deliberately NO
+    userspace pre-check of capability roots against the working set — the kernel is the
+    backstop, so a broker bug or an over-broad grant gets EACCES at open time, loudly."""
+    rules = [(str(HOME), _LANDLOCK_ACCESS)]
+    for r in extra_roots:
+        p = os.path.realpath(r)
+        if not os.path.exists(p):
+            raise OSError(f"--confinement-root {r!r} does not exist — refusing to start "
+                          "(caps rooted there would be kernel-denied at invoke)")
+        rules.append((p, _LANDLOCK_ACCESS))
+    rules += [(str(Path(__file__).resolve().parent), 4 | 8)]  # own source (git commit pin)
+    rules += [(p, 1 | 4 | 8) for p in _SYSTEM_RO]
+    # /etc: CA store + DNS config; /proc, /sys: self-exe, cpu count (DAC still applies)
+    rules += [(p, 4 | 8) for p in ("/etc", "/proc", "/sys")]
+    rules += [("/dev", 2 | 4 | 8)]  # /dev/null, /dev/urandom
+    _apply_landlock(rules)
+    _apply_seccomp_allowlist()
 
 
 class _Cgroup:
@@ -1287,6 +1379,8 @@ def cmd_audit(a):
 
 def cmd_serve(a):
     host, port = a.bind.rsplit(":", 1)
+    if a.self_confinement:
+        apply_self_confinement(a.confinement_root)  # before the server: no thread predates it
     srv = ThreadingHTTPServer((host, int(port)), Handler)
     owner = "with owner endpoints (/_tree, /_audit)" if OWNER_SECRET else "no owner secret (/_tree disabled)"
     print(f"capdel broker on http://{a.bind}  (state: {HOME}; {owner})", file=sys.stderr)
@@ -1336,7 +1430,15 @@ def main():
     ensure_home()
     p = argparse.ArgumentParser(prog="capdel")
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("serve"); s.add_argument("--bind", default="127.0.0.1:4571"); s.set_defaults(f=cmd_serve)
+    s = sub.add_parser("serve"); s.add_argument("--bind", default="127.0.0.1:4571")
+    s.add_argument("--self-confinement", action="store_true",
+                   help="confine THIS broker process (#24): Landlock to the working set + a seccomp syscall "
+                        "allowlist; every thread and exec child inherits both — a cap root outside the set is "
+                        "kernel-denied at invoke")
+    s.add_argument("--confinement-root", action="append", default=[], dest="confinement_root",
+                   help="read-write dir to add to the working set beyond CAPDEL_HOME (repeatable); e.g. an "
+                        "exec cwd_root or fs root you intend to grant")
+    s.set_defaults(f=cmd_serve)
     s = sub.add_parser("tunnel")
     s.add_argument("--relay", required=True); s.add_argument("--broker-id", dest="broker_id", required=True)
     s.add_argument("--broker", default="127.0.0.1:4571")
