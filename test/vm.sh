@@ -7,10 +7,14 @@
 #   bash test/vm.sh [branch]     # branch defaults to the current one; must be pushed
 #
 # What it proves, host-side over the forwarded broker port:
-#   1. /_api/version == the pushed branch's commit (the VM clones that exact branch)
+#   1. /_api/version == the pushed branch's commit (pinned via CAPDEL_COMMIT: the VM broker
+#      is self-confined (#24), so its `git rev-parse` fallback cannot read $HOME/.gitconfig)
 #   2. an allowlisted exec runs                                  (policy + kernel OK)
 #   3. a non-allowlisted exec is denied                          (policy)
 #   4. ls /etc FAILS under the sandbox although `ls` IS allowlisted  (Landlock, not policy)
+#   5. a broker-side read of a root OUTSIDE the broker's working set is kernel-denied (#24)
+#   6. a working-set root still reads through the same broker      (#24 control)
+#   7. an exec child syscall outside the broker allowlist dies with SIGSYS (#24 seccomp floor)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root
@@ -35,7 +39,8 @@ if [ ! -f "$IMG_CACHE" ]; then
 fi
 
 echo "== vm: building cloud-init seed (clone branch: ${BRANCH})"
-sed "s/-b main /-b ${BRANCH} /" test/cloud-init.yaml > "$WORK/user-data"
+sed -e "s/-b main /-b ${BRANCH} /" \
+    -e "s/^\( *\)CAPDEL_HOME=/\1CAPDEL_COMMIT=${SHA}\n\1CAPDEL_HOME=/" test/cloud-init.yaml > "$WORK/user-data"
 printf 'instance-id: capdel-vm-%s\nlocal-hostname: capdelvm\n' "$(date +%s)" > "$WORK/meta-data"
 genisoimage -quiet -output "$WORK/seed.iso" -volid CIDATA -joliet -rock "$WORK/user-data" "$WORK/meta-data"
 
@@ -102,6 +107,35 @@ checks.append(("`ls /etc` allowed by policy but FAILS under Landlock (real-kerne
                s == 200 and d.get("code") != 0, {"code": d.get("code"), "stderr": (d.get("stderr") or "")[:120]}))
 s, d = http("GET", "/whoami", tok)
 checks.append(("GET /whoami self-description from token only", s == 200 and d.get("id") == cap, d))
+
+# --- broker self-confinement (#24): the broker process itself, not the exec child ---------
+s, d = http("POST", "/_mint", owner, {"type": "fs",
+             "constraints": {"root": "/root/leak-root", "ops": ["read"]},
+             "name": "vm-outside-read", "ttl_s": 1800})
+assert s == 200 and d.get("token"), f"mint outside fs -> {s} {d}"
+outside_tok, outside_cap = d["token"], d["id"]
+s, d = http("POST", f"/caps/{outside_cap}/invoke", outside_tok,
+            {"op": "read", "path": "/root/leak-root/leak.txt"})
+# policy is fine (path IS inside the granted root) — the KERNEL must refuse the broker's open
+checks.append(("broker-side read outside the working set is kernel-denied (EACCES, not a policy 403)",
+               s == 404 and "Permission denied" in d.get("error", ""), d))
+s, d = http("POST", "/_mint", owner, {"type": "fs",
+             "constraints": {"root": "/srv/demo/pub", "ops": ["read"]},
+             "name": "vm-inside-read", "ttl_s": 1800})
+assert s == 200 and d.get("token"), f"mint inside fs -> {s} {d}"
+s, d = http("POST", f"/caps/{d['id']}/invoke", d["token"],
+            {"op": "read", "path": "/srv/demo/pub/readme.txt"})
+checks.append(("working-set root reads fine through the same broker (control)",
+               s == 200 and d.get("content", "").strip() == "public note", d))
+s, d = http("POST", "/_mint", owner, {"type": "exec",
+             "constraints": {"allow": [["python3"]], "cwd_root": "/srv/demo/work"},
+             "name": "vm-syscall-floor", "ttl_s": 1800})
+assert s == 200 and d.get("token"), f"mint floor exec -> {s} {d}"
+s, d = http("POST", f"/caps/{d['id']}/invoke", d["token"],
+            {"op": "run", "argv": ["python3", "-c",
+             "import ctypes; ctypes.CDLL(None).syscall(101, 0, 0, 0)"]})
+checks.append(("exec child syscall outside the broker allowlist dies with SIGSYS (code -31)",
+               s == 200 and d.get("code") == -31, d))
 
 failed = 0
 print(f"\n  vm checks — {len(checks)}\n  " + "-" * 60)

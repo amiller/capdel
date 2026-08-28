@@ -345,8 +345,24 @@ are granted read/execute access needed to start ordinary commands. The child may
 install a seccomp-BPF deny list via `deny_syscalls`; a denied syscall terminates with
 `SIGSYS`. `cpu_quota_us` and `memory_max_bytes` use a private cgroup-v2 subtree.
 If the kernel primitive or requested cgroup is unavailable, the invoke fails loudly;
-there is no userspace fallback. Disk-I/O quotas and broker self-confinement are out of
-scope and tracked separately.
+there is no userspace fallback. Disk-I/O quotas are out of scope and tracked separately (#25).
+
+#### Broker self-confinement (#24)
+
+`capdel serve --self-confinement` applies the same primitives to the broker process
+itself, before any request thread exists (every thread the broker spawns and every
+exec child inherits both filters): a Landlock ABI-1 ruleset over the broker's working
+set — `CAPDEL_HOME` plus any `--confinement-root` (read-write), the broker's own source
+directory, `/usr /bin /lib /lib64` (read/execute), `/etc /proc /sys` (read), `/dev`
+(read/write) — and a seccomp-BPF allowlist: a syscall outside the floor terminates the
+calling thread with `SIGSYS`. The working set, not the userspace checks, is the outer
+bound: an `fs` root or `exec` `cwd_root` outside it passes every broker check and is
+then denied by the kernel at open time — deliberately, because the point of kernel
+backing (#8/#24) is that a fallible userspace TCB is not the only barrier. There is no
+userspace pre-check of roots against the working set; a denial surfaces as the kernel's
+`EACCES`. Hosts whose `/etc/resolv.conf` is systemd-resolved's `/run` stub need that
+stub path inside the working set for DNS-backed `net`/`secret` invokes. The allowlist
+and the syscall tables are x86_64-only.
 
 ## 4. Security model
 

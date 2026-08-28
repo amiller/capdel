@@ -30,7 +30,7 @@ write_files:
       After=network-online.target
       [Service]
       EnvironmentFile=/etc/capdel.env
-      ExecStart=/usr/bin/python3 /opt/capdel/capdel.py serve --bind 0.0.0.0:4571
+      ExecStart=/usr/bin/python3 /opt/capdel/capdel.py serve --bind 0.0.0.0:4571 --self-confinement --confinement-root /srv/demo
       Restart=on-failure
       [Install]
       WantedBy=multi-user.target
@@ -40,6 +40,8 @@ runcmd:
   - install -d -m 700 /var/lib/capdel
   - install -d /srv/demo/pub /srv/demo/work
   - sh -c 'echo "public note" > /srv/demo/pub/readme.txt'
+  - install -d -m 700 /root/leak-root
+  - sh -c 'echo "TOP-SECRET-capdel-24" > /root/leak-root/leak.txt'
   - systemctl daemon-reload
   - systemctl enable --now capdel.service
   # sanity: the broker is up and mintable (owner-only, over localhost)
