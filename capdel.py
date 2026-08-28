@@ -714,10 +714,11 @@ def apply_self_confinement(extra_roots=()):
 class _Cgroup:
     def __init__(self, path): self.path = path
     def attach_self(self):
-        # Called as the child's preexec_fn, BEFORE exec: joining here means the process
-        # is inside the throttled cgroup for its very first instruction — attaching from
-        # the parent after Popen returns leaves a window where a fast child finishes
-        # before cpu.max/memory.max/io.max ever apply to it.
+        # Called as the child's preexec_fn, BEFORE exec and BEFORE apply_kernel_limits'
+        # Landlock restriction (which revokes write access outside cwd_root, cgroupfs
+        # included): joining here means the process is inside the throttled cgroup for its
+        # very first instruction — attaching from the parent after Popen returns leaves a
+        # window where a fast child finishes before cpu.max/memory.max/io.max apply to it.
         (self.path / "cgroup.procs").write_text(str(os.getpid()))
     def cleanup(self):
         self.path.rmdir()
@@ -782,8 +783,8 @@ def exec_invoke(cap, body):
     try:
         proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if body.get("stdin") is not None else None,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                preexec_fn=lambda: (apply_kernel_limits(c),
-                                                    cgroup and cgroup.attach_self()))
+                                preexec_fn=lambda: (cgroup and cgroup.attach_self(),
+                                                    apply_kernel_limits(c)))
         stdout, stderr = proc.communicate(body.get("stdin"), timeout=c.get("timeout_s", DEF_TIMEOUT))
     except subprocess.TimeoutExpired:
         proc.kill(); proc.communicate()
