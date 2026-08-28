@@ -16,7 +16,8 @@ def main():
     if sys.platform != "linux":
         print("SKIP: issue #8 needs Linux")
         return 77
-    with tempfile.TemporaryDirectory(prefix="capdel-kernel-") as tmp:
+    scratch = sys.argv[1] if len(sys.argv) > 1 else None
+    with tempfile.TemporaryDirectory(prefix="capdel-kernel-", dir=scratch) as tmp:
         root, outside = Path(tmp) / "inside", Path(tmp) / "outside"
         root.mkdir(); outside.write_text("secret\n")
         escaped = subprocess.run(
@@ -43,8 +44,10 @@ def main():
         assert proc.returncode == -9, (proc.returncode, stderr)
 
         # disk_max_bps (issue #25): io.max only sees real block-device I/O, so the file
-        # must live on a block-backed fs — /tmp is tmpfs on the VM; /var/tmp is the root disk.
-        io_root = Path(tempfile.mkdtemp(prefix="capdel-io-", dir="/var/tmp"))
+        # must live on a block-backed fs — /tmp is tmpfs on the VM; /var/tmp is the root
+        # disk. Under a self-confined broker's exec cap (#24) both sit outside the working
+        # set, so the VM rig passes a scratch dir on the same root disk instead.
+        io_root = Path(tempfile.mkdtemp(prefix="capdel-io-", dir=scratch or "/var/tmp"))
         try:
             size, quota = 16 * 1024 * 1024, 4 * 1024 * 1024
             dd = ["/bin/dd", "if=/dev/zero", f"of={io_root / 'blob'}", "bs=1M",

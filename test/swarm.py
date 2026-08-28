@@ -156,7 +156,9 @@ def main():
     ECHO_PORT = free_port()
     port = free_port()
     BASE = f"http://127.0.0.1:{port}"
-    tmp = tempfile.mkdtemp(prefix="capdel-swarm-")
+    # Optional scratch dir: under a self-confined broker's exec cap (#24), /tmp is outside
+    # the Landlock working set — the VM rig passes /srv/demo (same root disk).
+    tmp = tempfile.mkdtemp(prefix="capdel-swarm-", dir=sys.argv[1] if len(sys.argv) > 1 else None)
     os.environ["CAPDEL_HOME"] = os.path.join(tmp, "state")
     content = Path(tmp) / "content"
     (content / "pub").mkdir(parents=True); (content / "work").mkdir()

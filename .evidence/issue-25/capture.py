@@ -20,7 +20,9 @@ import urllib.request
 
 BASE = "http://127.0.0.1:4571"
 MIB = 1024 * 1024
-DEMO = "/var/tmp/capdel-demo"
+# Inside the self-confined broker's working set (#24 rw --confinement-root); it sits on
+# the same root disk as /var/tmp, and io.max throttles the device, not the path.
+DEMO = "/srv/demo/capdel-demo"
 
 # O_SYNC so every write() is real block-device I/O (io.max never sees the page cache).
 WRITE = r"""
@@ -109,14 +111,14 @@ def main():
     print("\n== 3. kernel test rig (test/kernel.py) under an exec cap ==")
     k_tok, k_id = mint_exec("kernel-rig", {"allow": [["python3"]], "cwd_root": "/", "timeout_s": 300})
     s, d = http("POST", f"/caps/{k_id}/invoke", k_tok,
-                {"op": "run", "argv": ["python3", "test/kernel.py"], "cwd": "/opt/capdel"})
+                {"op": "run", "argv": ["python3", "test/kernel.py", "/srv/demo"], "cwd": "/opt/capdel"})
     print(d.get("stdout", "").strip() or d)
     checks.append(("test/kernel.py PASS on the VM (now incl. io.max case)",
                    s == 200 and d.get("code") == 0 and "PASS" in d.get("stdout", "")))
 
     print("\n== 4. regression: test/swarm.py on the VM ==")
     s, d = http("POST", f"/caps/{k_id}/invoke", k_tok,
-                {"op": "run", "argv": ["python3", "test/swarm.py"], "cwd": "/opt/capdel"})
+                {"op": "run", "argv": ["python3", "test/swarm.py", "/srv/demo"], "cwd": "/opt/capdel"})
     tail = "\n".join(d.get("stdout", "").strip().splitlines()[-3:])
     print(tail or d)
     checks.append(("test/swarm.py green on the VM", s == 200 and d.get("code") == 0
