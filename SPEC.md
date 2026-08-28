@@ -411,6 +411,9 @@ GET  /_api/version                                                → {server, c
 POST /_event                Bearer <owner-secret>   {"name":…}                     → {event, closed[], count}   # trusted closure
 ```
 
+Owner-secret checks on `/_tree`, `/_audit`, `/_gc`, and `/_event` use a constant-time
+comparison; an unset owner secret refuses every owner endpoint.
+
 fs invoke ops: `{"op":"list","path"}`, `{"op":"read","path"}`, `{"op":"write","path","content"}`,
 `{"op":"stat","path"}`. exec invoke: `{"op":"run","argv":[…],"cwd"?,"stdin"?}` →
 `{code, stdout, stderr, truncated}`. net invoke:
