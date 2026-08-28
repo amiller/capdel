@@ -1,34 +1,18 @@
-# PLAN — issue #24: broker self-confinement (Landlock + seccomp allowlist)
+# Issue #25 — disk I/O quotas (io.max) for exec capabilities
 
-Acceptance (issue body):
-- The broker process (and any thread it spawns) runs under its own Landlock ruleset + seccomp
-  allowlist, so a broker bug cannot read outside its working set; a test in `test/` demonstrates
-  a broker-side outside-root read being kernel-denied.
+Acceptance: "An exec cap with a disk I/O quota, throttled by cgroup-v2 io.max when
+exceeded — shown in a test, same rig as test/kernel.py."
 
-Evidence tier: **Tier 1** (backend behavior, no UI) — HTTP transcript against the disposable VM
-staging host (`test/cloud-init.yaml`) with `GET /_api/version` pinned to the PR commit, mirroring
-PR #23's accepted format. Worker host has no Landlock LSM → all kernel evidence on the VM.
-
-## Steps
-- [x] capdel.py: generalize `_apply_landlock` to a (path, access) rules list (exec-child behavior unchanged);
-      factor the seccomp filter load; add `_BROKER_SYSCALLS` allowlist + `_apply_seccomp_allowlist`;
-      add `apply_self_confinement(extra_roots)`; wire `serve --self-confinement [--confinement-root P]`
-      to apply it before the server (and any thread) exists.
-- [x] Working set: CAPDEL_HOME + extra roots (rw) ∪ own source dir, /usr,/bin,/lib,/lib64 (r-x) ∪
-      /etc,/proc,/sys (r) ∪ /dev (rw). No /run: hosts with systemd-resolved stub DNS must add it
-      (documented in SPEC). No userspace pre-check of cap roots vs the working set — the kernel IS
-      the backstop; denial surfaces as EACCES.
-- [x] SPEC.md §3.8: amend "broker self-confinement ... out of scope" → new subsection (#24).
-- [x] test/kernel_broker.py (new): unconfined broker leaks an outside-root read (before);
-      self-confined broker: inside read 200, outside read 404 "Permission denied" (kernel),
-      exec child syscall outside allowlist → SIGSYS (-31). Run on the VM.
-- [x] test/cloud-init.yaml: VM broker runs self-confined (+ --confinement-root /srv/demo);
-      add /root/leak-root fixture. test/vm.sh: pin CAPDEL_COMMIT via env, add 3 host-side checks
-      (outside read kernel-denied, control read 200, child SIGSYS floor). test/README.md note.
-- [x] Verify locally: py_compile, swarm.py 13/14+skip baseline holds; seccomp-only broker copy
-      passes swarm.py on this host (allowlist coverage for threads/HTTP/fs/net/escalate paths).
-- [x] Verify on VM: push branch → `bash test/vm.sh ready-24` all green; in-VM: kernel.py (#8
-      regression), kernel_broker.py (#24), swarm.py (14/14). Capture before/after transcripts
-      → `.evidence/issue-24/`.
-- [x] PR (base=main, Tier 1 body per template) → swap issue label ready→in-review; label PR
-      ready-to-merge only after evidence committed. Never merge.
+- [ ] `disk_max_bps` constraint on exec caps (bytes/s, read and write): validated,
+      subset-narrowed only (same family rule as cpu_quota_us/memory_max_bytes),
+      CLI `--disk-max-bps`, applied by `attach_cgroup` via cgroup-v2 `io.max` on the
+      device backing `cwd_root`; io controller enabled at root when missing; loud
+      failure when the kernel primitive is unavailable (no fallback).
+- [ ] `test/kernel.py` case on the disposable-VM rig: an over-quota O_DIRECT write is
+      throttled (elapsed ≥ bytes/quota and ≫ the unthrottled baseline).
+- [ ] SPEC.md amended where it declared disk I/O quotas future work (non-goals line +
+      §3.8 platform annex).
+- [ ] Evidence (Tier 1, same rig as #8): HTTP transcript against the live VM broker with
+      `GET /_api/version` pinned to the branch commit — throttled vs baseline write,
+      attenuation narrowing + rejection, `test/kernel.py` PASS, `test/swarm.py`
+      regression — committed to `.evidence/issue-25/`.
