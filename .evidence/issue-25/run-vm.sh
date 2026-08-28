@@ -78,6 +78,8 @@ assert s == 200 and d.get("token"), f"mint runner -> {s} {d}"
 s, d = http("POST", f"/caps/{d['id']}/invoke", d["token"],
             {"op": "run", "argv": ["python3", ".evidence/issue-25/capture.py"], "cwd": "/opt/capdel"})
 print(d.get("stdout", "") or d, end="")
+if d.get("stderr"):
+    print(f"--- child stderr ---\n{d['stderr']}", end="", file=sys.stderr)
 sys.exit(0 if (s == 200 and d.get("code") == 0 and "CAPTURE-OK" in d.get("stdout", "")) else 1)
 EOF
 echo "== vm: capture green"

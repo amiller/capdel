@@ -723,6 +723,22 @@ class _Cgroup:
         self.path.rmdir()
 
 
+def _disk_dev(dev):
+    # io.max throttles at the whole-disk request queue — naming a partition (e.g. vda1,
+    # what os.stat().st_dev reports for files on it) fails with ENODEV, so walk up the
+    # sysfs device chain to the ancestor /sys/block lists (nvme nests a namespace under
+    # its controller, .../nvme0/nvme0n1/nvme0n1p2; sata/virtio are flat, .../vda/vda1).
+    node = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+    if not node.exists():
+        raise OSError(f"cwd_root is not on a block device ({os.major(dev)}:{os.minor(dev)}); "
+                      "disk_max_bps applies only to block-backed filesystems")
+    node = node.resolve()
+    for anc in (node, *node.parents):
+        if (Path("/sys/block") / anc.name).is_dir():
+            return (Path("/sys/block") / anc.name / "dev").read_text().strip()
+    raise OSError(f"no whole-disk ancestor of {os.major(dev)}:{os.minor(dev)} in /sys/block")
+
+
 def prepare_cgroup(constraints):
     if not any(key in constraints for key in ("cpu_quota_us", "memory_max_bytes", "disk_max_bps")):
         return None
@@ -745,9 +761,9 @@ def prepare_cgroup(constraints):
         if "memory_max_bytes" in constraints:
             (path / "memory.max").write_text(str(constraints["memory_max_bytes"]))
         if "disk_max_bps" in constraints:
-            dev = os.stat(constraints["cwd_root"]).st_dev
+            disk = _disk_dev(os.stat(constraints["cwd_root"]).st_dev)
             (path / "io.max").write_text(
-                f"{os.major(dev)}:{os.minor(dev)} rbps={constraints['disk_max_bps']} "
+                f"{disk} rbps={constraints['disk_max_bps']} "
                 f"wbps={constraints['disk_max_bps']} riops=max wiops=max")
     except BaseException:
         path.rmdir()
@@ -1469,7 +1485,7 @@ def main():
     s.add_argument("--cpu-quota-us", type=int, dest="cpu_quota_us")
     s.add_argument("--memory-max-bytes", type=int, dest="memory_max_bytes")
     s.add_argument("--disk-max-bps", type=int, dest="disk_max_bps",
-                   help="exec: cap disk I/O at N bytes/s (read and write) on the device backing cwd_root, via cgroup-v2 io.max")
+                   help="exec: cap disk I/O at N bytes/s (read and write) on the whole disk backing cwd_root, via cgroup-v2 io.max")
     s.add_argument("--models", action="append", default=[], help="llm: allowed model name(s), repeatable or comma-sep")
     s.add_argument("--base-url", dest="base_url", help="llm: OpenAI-compatible base (default z.ai coding paas)")
     s.add_argument("--max-tokens", type=int, dest="max_tokens", help="llm: cap max_tokens per call")

@@ -343,12 +343,13 @@ ABI-1 ruleset rooted at `cwd_root`. The root is granted the capability's filesys
 access; only the interpreter and loader directories (`/usr`, `/bin`, `/lib`, `/lib64`)
 are granted read/execute access needed to start ordinary commands. The child may also
 install a seccomp-BPF deny list via `deny_syscalls`; a denied syscall terminates with
-`SIGSYS`. `cpu_quota_us`, `memory_max_bytes`, and `disk_max_bps` (bytes/s, read and write,
-on the device backing `cwd_root`) use a private cgroup-v2 subtree (`cpu.max`,
-`memory.max`, `io.max`) that the child joins before `exec`, so no un-throttled window
-precedes the limits; for `disk_max_bps` the io controller is enabled at the cgroup
-root if missing. If the kernel primitive or requested cgroup is unavailable, the invoke
-fails loudly; there is no userspace fallback.
+`SIGSYS`. `cpu_quota_us`, `memory_max_bytes`, and `disk_max_bps` (bytes/s, read and write)
+use a private cgroup-v2 subtree (`cpu.max`, `memory.max`, `io.max`) that the child joins
+before `exec`, so no un-throttled window precedes the limits. `disk_max_bps` throttles the
+whole disk containing `cwd_root` — the io controller works at the disk's request queue and
+rejects partitions — and the io controller is enabled at the cgroup root if missing. If
+the kernel primitive or requested cgroup is unavailable, the invoke fails loudly; there is
+no userspace fallback.
 
 #### Broker self-confinement (#24)
 
