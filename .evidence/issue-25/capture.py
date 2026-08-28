@@ -66,7 +66,7 @@ def run_write(token, cid, mib, label):
     # whose pages are still clean-warm in the page cache from a *previous cgroup's*
     # write gets undercharged once (measured 1.2s vs 4.0s for 16MiB @ 4MiB/s) — fresh
     # files, direct IO and repeated rewrites all throttle at exactly bytes/bps.
-    path = f"{DEMO}/blob-{label}-{time.monotonic_ns()}"
+    path = f"{DEMO}/blob-{mib}MiB-{time.monotonic_ns()}"
     s, d = http("POST", f"/caps/{cid}/invoke", token,
                 {"op": "run", "argv": ["python3", "-c", WRITE, str(mib), path],
                  "cwd": DEMO})
