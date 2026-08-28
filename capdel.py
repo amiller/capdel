@@ -356,7 +356,7 @@ def validate_constraints(type_, c):
             raise Denied("exec constraints need an absolute 'cwd_root'")
         if not isinstance(c.get("deny_syscalls", []), list) or any(not isinstance(name, str) for name in c.get("deny_syscalls", [])):
             raise Denied("exec 'deny_syscalls' must contain syscall names")
-        for key in ("cpu_quota_us", "memory_max_bytes"):
+        for key in ("cpu_quota_us", "memory_max_bytes", "disk_max_bps"):
             if key in c and (not isinstance(c[key], int) or c[key] <= 0):
                 raise Denied(f"exec {key} must be a positive integer")
     elif type_ == "net":
@@ -409,7 +409,7 @@ def check_subset(type_, child, parent_cap):
             raise Denied("max_output exceeds parent's")
         if not set(child.get("deny_syscalls", [])) >= set(p.get("deny_syscalls", [])):
             raise Denied("exec deny_syscalls may only be narrowed")
-        for key in ("cpu_quota_us", "memory_max_bytes"):
+        for key in ("cpu_quota_us", "memory_max_bytes", "disk_max_bps"):
             if key in child and (key not in p or child[key] >= p[key]):
                 raise Denied(f"{key} may only be narrowed")
             if key not in child and key in p:
@@ -706,6 +706,11 @@ def apply_self_confinement(extra_roots=()):
     rules += [(p, 1 | 4 | 8) for p in _SYSTEM_RO]
     # /etc: CA store + DNS config; /proc, /sys: self-exe, cpu count (DAC still applies)
     rules += [(p, 4 | 8) for p in ("/etc", "/proc", "/sys")]
+    # /sys/fs/cgroup, write-side only (#23/#25): exec resource limits create, program and
+    # join per-invocation cgroups from the broker process and from the child's preexec_fn
+    # (before its own ruleset stacks and denies cgroupfs); reads are covered by the /sys
+    # rule above, and the writes are still bounded by kernel cgroup delegation.
+    rules += [("/sys/fs/cgroup", 2 | 16 | 128)]
     rules += [("/dev", 2 | 4 | 8)]  # /dev/null, /dev/urandom
     _apply_landlock(rules)
     _apply_seccomp_allowlist()
@@ -713,24 +718,59 @@ def apply_self_confinement(extra_roots=()):
 
 class _Cgroup:
     def __init__(self, path): self.path = path
+    def attach_self(self):
+        # Called as the child's preexec_fn, BEFORE exec and BEFORE apply_kernel_limits'
+        # Landlock restriction (which revokes write access outside cwd_root, cgroupfs
+        # included): joining here means the process is inside the throttled cgroup for its
+        # very first instruction — attaching from the parent after Popen returns leaves a
+        # window where a fast child finishes before cpu.max/memory.max/io.max apply to it.
+        (self.path / "cgroup.procs").write_text(str(os.getpid()))
     def cleanup(self):
         self.path.rmdir()
 
 
-def attach_cgroup(pid, constraints):
-    if not any(key in constraints for key in ("cpu_quota_us", "memory_max_bytes")):
+def _disk_dev(dev):
+    # io.max throttles at the whole-disk request queue — naming a partition (e.g. vda1,
+    # what os.stat().st_dev reports for files on it) fails with ENODEV, so walk up the
+    # sysfs device chain to the ancestor /sys/block lists (nvme nests a namespace under
+    # its controller, .../nvme0/nvme0n1/nvme0n1p2; sata/virtio are flat, .../vda/vda1).
+    node = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+    if not node.exists():
+        raise OSError(f"cwd_root is not on a block device ({os.major(dev)}:{os.minor(dev)}); "
+                      "disk_max_bps applies only to block-backed filesystems")
+    node = node.resolve()
+    for anc in (node, *node.parents):
+        if (Path("/sys/block") / anc.name).is_dir():
+            return (Path("/sys/block") / anc.name / "dev").read_text().strip()
+    raise OSError(f"no whole-disk ancestor of {os.major(dev)}:{os.minor(dev)} in /sys/block")
+
+
+def prepare_cgroup(constraints):
+    if not any(key in constraints for key in ("cpu_quota_us", "memory_max_bytes", "disk_max_bps")):
         return None
     root = Path("/sys/fs/cgroup")
     if not (root / "cgroup.controllers").exists():
         raise OSError("cgroup v2 is required for exec resource limits")
-    path = root / f"capdel-{os.getpid()}-{pid}"
+    if "disk_max_bps" in constraints:
+        # io.max throttles one device per line; the per-invocation cgroup below gets an
+        # io.max file only if "io" is enabled in the root's subtree_control. systemd
+        # enables cpu/memory at root by default but not io, so turn it on when missing.
+        if "io" not in (root / "cgroup.controllers").read_text().split():
+            raise OSError("cgroup v2 io controller is required for disk_max_bps")
+        if "io" not in (root / "cgroup.subtree_control").read_text().split():
+            (root / "cgroup.subtree_control").write_text("+io")
+    path = root / f"capdel-{os.getpid()}-{secrets.token_hex(4)}"
     path.mkdir()
     try:
         if "cpu_quota_us" in constraints:
             (path / "cpu.max").write_text(f"{constraints['cpu_quota_us']} 100000")
         if "memory_max_bytes" in constraints:
             (path / "memory.max").write_text(str(constraints["memory_max_bytes"]))
-        (path / "cgroup.procs").write_text(str(pid))
+        if "disk_max_bps" in constraints:
+            disk = _disk_dev(os.stat(constraints["cwd_root"]).st_dev)
+            (path / "io.max").write_text(
+                f"{disk} rbps={constraints['disk_max_bps']} "
+                f"wbps={constraints['disk_max_bps']} riops=max wiops=max")
     except BaseException:
         path.rmdir()
         raise
@@ -744,15 +784,12 @@ def exec_invoke(cap, body):
     if not any(argv[:len(pref)] == pref for pref in c["allow"]):
         raise Denied(f"argv {argv[:3]}… does not extend any allowed prefix {c['allow']}")
     cwd = resolve_inside(c["cwd_root"], body.get("cwd", c["cwd_root"]))
-    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if body.get("stdin") is not None else None,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            preexec_fn=lambda: apply_kernel_limits(c))
+    cgroup = prepare_cgroup(c)
     try:
-        cgroup = attach_cgroup(proc.pid, c)
-    except BaseException:
-        proc.kill(); proc.wait()
-        raise
-    try:
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if body.get("stdin") is not None else None,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: (cgroup and cgroup.attach_self(),
+                                                    apply_kernel_limits(c)))
         stdout, stderr = proc.communicate(body.get("stdin"), timeout=c.get("timeout_s", DEF_TIMEOUT))
     except subprocess.TimeoutExpired:
         proc.kill(); proc.communicate()
@@ -1244,6 +1281,7 @@ def cmd_mint(a):
         if a.deny_syscall: constraints["deny_syscalls"] = a.deny_syscall
         if a.cpu_quota_us: constraints["cpu_quota_us"] = a.cpu_quota_us
         if a.memory_max_bytes: constraints["memory_max_bytes"] = a.memory_max_bytes
+        if a.disk_max_bps: constraints["disk_max_bps"] = a.disk_max_bps
     elif a.type == "net":
         constraints = {"allow": [parse_dest(al) for al in a.allow]}
         if a.max_bytes: constraints["max_bytes"] = a.max_bytes
@@ -1452,6 +1490,8 @@ def main():
     s.add_argument("--deny-syscall", action="append", default=[], dest="deny_syscall")
     s.add_argument("--cpu-quota-us", type=int, dest="cpu_quota_us")
     s.add_argument("--memory-max-bytes", type=int, dest="memory_max_bytes")
+    s.add_argument("--disk-max-bps", type=int, dest="disk_max_bps",
+                   help="exec: cap disk I/O at N bytes/s (read and write) on the whole disk backing cwd_root, via cgroup-v2 io.max")
     s.add_argument("--models", action="append", default=[], help="llm: allowed model name(s), repeatable or comma-sep")
     s.add_argument("--base-url", dest="base_url", help="llm: OpenAI-compatible base (default z.ai coding paas)")
     s.add_argument("--max-tokens", type=int, dest="max_tokens", help="llm: cap max_tokens per call")

@@ -57,7 +57,7 @@ R8. **Cheap.** No per-capability container. Enforcement happens in one broker
 
 Non-goals for v0: browser-cookie/account delegation (that's oauth3's lane), offline
 attenuation (Biscuit-style), multi-user federation, signed audit. Exec resource limits
-are implemented by the platform-specific annex below; disk I/O quotas remain future work.
+(CPU, memory, disk I/O) are implemented by the platform-specific annex below.
 
 ## 3. Design
 
@@ -343,9 +343,13 @@ ABI-1 ruleset rooted at `cwd_root`. The root is granted the capability's filesys
 access; only the interpreter and loader directories (`/usr`, `/bin`, `/lib`, `/lib64`)
 are granted read/execute access needed to start ordinary commands. The child may also
 install a seccomp-BPF deny list via `deny_syscalls`; a denied syscall terminates with
-`SIGSYS`. `cpu_quota_us` and `memory_max_bytes` use a private cgroup-v2 subtree.
-If the kernel primitive or requested cgroup is unavailable, the invoke fails loudly;
-there is no userspace fallback. Disk-I/O quotas are out of scope and tracked separately (#25).
+`SIGSYS`. `cpu_quota_us`, `memory_max_bytes`, and `disk_max_bps` (bytes/s, read and write)
+use a private cgroup-v2 subtree (`cpu.max`, `memory.max`, `io.max`) that the child joins
+before `exec`, so no un-throttled window precedes the limits. `disk_max_bps` throttles the
+whole disk containing `cwd_root` — the io controller works at the disk's request queue and
+rejects partitions — and the io controller is enabled at the cgroup root if missing. If
+the kernel primitive or requested cgroup is unavailable, the invoke fails loudly; there is
+no userspace fallback.
 
 #### Broker self-confinement (#24)
 
@@ -353,8 +357,9 @@ there is no userspace fallback. Disk-I/O quotas are out of scope and tracked sep
 itself, before any request thread exists (every thread the broker spawns and every
 exec child inherits both filters): a Landlock ABI-1 ruleset over the broker's working
 set — `CAPDEL_HOME` plus any `--confinement-root` (read-write), the broker's own source
-directory, `/usr /bin /lib /lib64` (read/execute), `/etc /proc /sys` (read), `/dev`
-(read/write) — and a seccomp-BPF allowlist: a syscall outside the floor terminates the
+directory, `/usr /bin /lib /lib64` (read/execute), `/etc /proc /sys` (read),
+`/sys/fs/cgroup` (write — the exec resource limits create and join per-invocation
+subtrees there), `/dev` (read/write) — and a seccomp-BPF allowlist: a syscall outside the floor terminates the
 calling thread with `SIGSYS`. The working set, not the userspace checks, is the outer
 bound: an `fs` root or `exec` `cwd_root` outside it passes every broker check and is
 then denied by the kernel at open time — deliberately, because the point of kernel
