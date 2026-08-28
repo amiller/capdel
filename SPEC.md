@@ -357,8 +357,9 @@ no userspace fallback.
 itself, before any request thread exists (every thread the broker spawns and every
 exec child inherits both filters): a Landlock ABI-1 ruleset over the broker's working
 set — `CAPDEL_HOME` plus any `--confinement-root` (read-write), the broker's own source
-directory, `/usr /bin /lib /lib64` (read/execute), `/etc /proc /sys` (read), `/dev`
-(read/write) — and a seccomp-BPF allowlist: a syscall outside the floor terminates the
+directory, `/usr /bin /lib /lib64` (read/execute), `/etc /proc /sys` (read),
+`/sys/fs/cgroup` (write — the exec resource limits create and join per-invocation
+subtrees there), `/dev` (read/write) — and a seccomp-BPF allowlist: a syscall outside the floor terminates the
 calling thread with `SIGSYS`. The working set, not the userspace checks, is the outer
 bound: an `fs` root or `exec` `cwd_root` outside it passes every broker check and is
 then denied by the kernel at open time — deliberately, because the point of kernel

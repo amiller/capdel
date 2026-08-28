@@ -706,6 +706,11 @@ def apply_self_confinement(extra_roots=()):
     rules += [(p, 1 | 4 | 8) for p in _SYSTEM_RO]
     # /etc: CA store + DNS config; /proc, /sys: self-exe, cpu count (DAC still applies)
     rules += [(p, 4 | 8) for p in ("/etc", "/proc", "/sys")]
+    # /sys/fs/cgroup, write-side only (#23/#25): exec resource limits create, program and
+    # join per-invocation cgroups from the broker process and from the child's preexec_fn
+    # (before its own ruleset stacks and denies cgroupfs); reads are covered by the /sys
+    # rule above, and the writes are still bounded by kernel cgroup delegation.
+    rules += [("/sys/fs/cgroup", 2 | 16 | 128)]
     rules += [("/dev", 2 | 4 | 8)]  # /dev/null, /dev/urandom
     _apply_landlock(rules)
     _apply_seccomp_allowlist()
